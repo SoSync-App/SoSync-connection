@@ -35,35 +35,38 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.exceptions import InvalidSignature
 from pyhpke import AEADId, CipherSuite, KDFId, KEMId
 
-PORT = int(os.environ.get("BESMART_COMPANION_PORT", "8765"))
+PORT = int(os.environ.get("SOSYNC_COMPANION_PORT", "8765"))
 DEFAULT_HOME_ASSISTANT_URL = "http://127.0.0.1:8123"
 DEFAULT_COMPANION_URL = "http://127.0.0.1:8765"
 REMOTE_PREFIX = "/remote/ha"
 SIGNED_REMOTE_PREFIX = "/remote/signed"
 SIGNED_REMOTE_PATTERN = re.compile(r"^/remote/signed/([0-9]{10,})/([A-Za-z0-9_-]{16,})/([A-Za-z0-9_-]{20,})/ha(/.*)?$")
 SIGNED_ROUTE_MAX_TTL_SECONDS = 300
-DATA_DIR = os.environ.get("BESMART_DATA_DIR", "/data")
-REMOTE_TOKEN_FILE = os.path.join(DATA_DIR, "besmart_remote_token")
-HA_UPSTREAM_FILE = os.path.join(DATA_DIR, "besmart_ha_upstream")
-SERVER_ID_FILE = os.path.join(DATA_DIR, "besmart_server_id")
-REMOTE_URL_FILE = os.path.join(DATA_DIR, "besmart_remote_url")
-HOME_PROFILE_FILE = os.path.join(DATA_DIR, "besmart_home_profile.json")
+DATA_DIR = os.environ.get("SOSYNC_DATA_DIR", "/data")
+REMOTE_TOKEN_FILE = os.path.join(DATA_DIR, "sosync_remote_token")
+HA_UPSTREAM_FILE = os.path.join(DATA_DIR, "sosync_ha_upstream")
+SERVER_ID_FILE = os.path.join(DATA_DIR, "sosync_server_id")
+REMOTE_URL_FILE = os.path.join(DATA_DIR, "sosync_remote_url")
+HOME_PROFILE_FILE = os.path.join(DATA_DIR, "sosync_home_profile.json")
 ADDON_OPTIONS_FILE = os.path.join(DATA_DIR, "options.json")
-COMPANION_IDENTITY_FILE = os.path.join(DATA_DIR, "besmart_companion_identity.json")
-PAIRINGS_FILE = os.path.join(DATA_DIR, "besmart_pairings.json")
-E2EE_IDENTITY_FILE = os.path.join(DATA_DIR, "besmart_e2ee_identity.json")
-E2EE_PAIRINGS_FILE = os.path.join(DATA_DIR, "besmart_e2ee_pairings.json")
-SECURE_REMOTE_BINDING_FILE = os.path.join(DATA_DIR, "besmart_secure_remote_binding.json")
-SECURE_REMOTE_TUNNEL_TOKEN_FILE = os.path.join(DATA_DIR, "besmart_secure_remote_tunnel_token")
-SECURE_REMOTE_TUNNEL_STDERR_FILE = os.path.join(DATA_DIR, "besmart_secure_remote_cloudflared_stderr.log")
-CONSUMED_PACKAGES_FILE = os.path.join(DATA_DIR, "besmart_consumed_setup_packages.json")
-REMOTE_TOKEN_HEADER = "X-BeSmart-Remote-Token"
-HOME_PROFILE_PATH = "/besmart/home-profile"
+COMPANION_IDENTITY_FILE = os.path.join(DATA_DIR, "sosync_companion_identity.json")
+PAIRINGS_FILE = os.path.join(DATA_DIR, "sosync_pairings.json")
+E2EE_IDENTITY_FILE = os.path.join(DATA_DIR, "sosync_e2ee_identity.json")
+E2EE_PAIRINGS_FILE = os.path.join(DATA_DIR, "sosync_e2ee_pairings.json")
+SECURE_REMOTE_BINDING_FILE = os.path.join(DATA_DIR, "sosync_secure_remote_binding.json")
+SECURE_REMOTE_TUNNEL_TOKEN_FILE = os.path.join(DATA_DIR, "sosync_secure_remote_tunnel_token")
+SECURE_REMOTE_TUNNEL_STDERR_FILE = os.path.join(DATA_DIR, "sosync_secure_remote_cloudflared_stderr.log")
+CONSUMED_PACKAGES_FILE = os.path.join(DATA_DIR, "sosync_consumed_setup_packages.json")
+REMOTE_TOKEN_HEADER = "X-SoSync-Remote-Token"
+LOCAL_PAIRING_TOKEN_HEADER = "X-SoSync-Local-Pairing-Token"
+LEGACY_LOCAL_PAIRING_TOKEN_HEADER = "X-BeSmart-Local-Pairing-Token"
+HOME_PROFILE_PATH = "/sosync/home-profile"
+LEGACY_HOME_PROFILE_PATH = "/besmart/home-profile"
 MAX_HOME_PROFILE_BYTES = 512 * 1024
 HOME_PROFILE_WRITE_LOCK = threading.Lock()
 PAIRING_TTL_SECONDS = 120
 E2EE_PROTOCOL_VERSION = 1
-SETUP_PACKAGE_INFO = b"besmart-sosync-remote-setup-package-v1"
+SETUP_PACKAGE_INFO = b"sosync-remote-setup-package-v1"
 SETUP_PACKAGE_ENCRYPTION_ALG = "HPKE-X25519-HKDF-SHA256-CHACHA20-POLY1305"
 SETUP_PACKAGE_SIGNATURE_ALG = "Ed25519"
 RUNTIME_INSTANCE_ID = str(uuid.uuid4())
@@ -134,6 +137,44 @@ def companion_path_class(path):
     if request_path.startswith("/remote/"):
         return "legacyRemoteProxy"
     return "other"
+
+
+def is_home_profile_path(path):
+    request_path = urlparse(path or "/").path
+    return request_path in (HOME_PROFILE_PATH, LEGACY_HOME_PROFILE_PATH)
+
+
+def local_pairing_token_contract(headers):
+    canonical = str(headers.get(LOCAL_PAIRING_TOKEN_HEADER) or "").strip()
+    legacy = str(headers.get(LEGACY_LOCAL_PAIRING_TOKEN_HEADER) or "").strip()
+    if canonical and legacy:
+        return ("both", canonical)
+    if canonical:
+        return ("soSyncCanonical", canonical)
+    if legacy:
+        return ("legacyBeSmart", legacy)
+    return ("missing", "")
+
+
+def safe_pairing_payload_schema_version(data):
+    if isinstance(data, dict):
+        value = data.get("protocol_version")
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, str) and value.strip().isdigit():
+            return value.strip()
+    return "unknown"
+
+
+def log_e2ee_pairing_rejection(path_class, header_contract, payload_schema_version, rejection_class):
+    print(
+        "[SOSYNC-E2EE-COMPANION] pairingRequestRejected "
+        f"pathClass={path_class} "
+        f"headerContract={header_contract} "
+        f"payloadSchemaVersion={payload_schema_version} "
+        f"rejectionClass={rejection_class}",
+        flush=True
+    )
 
 
 def companion_request_started(method, path):
@@ -494,7 +535,7 @@ class Handler(BaseHTTPRequestHandler):
             self._proxy_home_assistant()
             return
 
-        if self.path == HOME_PROFILE_PATH:
+        if is_home_profile_path(self.path):
             self._handle_home_profile_get()
             return
 
@@ -503,7 +544,7 @@ class Handler(BaseHTTPRequestHandler):
             secure_remote_status = secure_remote_public_status()
             self._json(200, {
                 "status": "ok",
-                "service": "besmart-companion",
+                "service": "sosync-companion",
                 "companion_version": SOSYNC_COMPANION_VERSION,
                 "build": SOSYNC_COMPANION_BUILD,
                 "build_marker": SOSYNC_COMPANION_BUILD,
@@ -579,7 +620,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json(404, {
             "error": "not_found",
-            "service": "besmart-companion",
+            "service": "sosync-companion",
             "route": "fallback"
         }, headers={
             "X-SoSync-Origin": "companion",
@@ -597,7 +638,7 @@ class Handler(BaseHTTPRequestHandler):
         if self._handle_secure_remote_dataplane_request(urlparse(self.path).path):
             return
 
-        if self.path == HOME_PROFILE_PATH:
+        if is_home_profile_path(self.path):
             self._handle_home_profile_put()
             return
 
@@ -1129,7 +1170,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(403, {
                 "protocol_version": 1,
                 "status": "unbound",
-                "service": "besmart-companion-secure-remote",
+                "service": "sosync-companion-secure-remote",
                 "tunnel_state": "unconfigured",
                 "route_id_fingerprint": safe_fingerprint(binding.get("route_id")),
                 "tunnel_binding_fingerprint": safe_fingerprint(binding.get("tunnel_binding_id"))
@@ -1153,7 +1194,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200 if connector_status["connector_healthy"] else 503, {
             "protocol_version": 1,
             "status": "ok" if connector_status["connector_healthy"] else "unavailable",
-            "service": "besmart-companion-secure-remote",
+            "service": "sosync-companion-secure-remote",
             "tunnel_state": "active" if connector_status["connector_healthy"] else ("connectorStarting" if process_running else "unconfigured"),
             "cloudflared_process_alive": process_running,
             "connector_state": connector_status["connector_state"],
@@ -1205,17 +1246,36 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, e2ee_pairing_authorization_status())
 
     def _handle_e2ee_pair(self):
+        header_contract, _ = local_pairing_token_contract(self.headers)
         if not has_local_e2ee_pairing_authorization(self.headers):
+            log_e2ee_pairing_rejection(
+                "e2eePair",
+                header_contract,
+                "unknown",
+                "local_pairing_authorization_required"
+            )
             self._json(401, {"error": "local_pairing_authorization_required"})
             return
 
         try:
             data = self._read_json_body(16 * 1024)
         except ValueError as error:
+            log_e2ee_pairing_rejection(
+                "e2eePair",
+                header_contract,
+                "unknown",
+                "json_decode_failure"
+            )
             self._json(400, {"error": str(error)})
             return
 
         if data.get("protocol_version") != E2EE_PROTOCOL_VERSION:
+            log_e2ee_pairing_rejection(
+                "e2eePair",
+                header_contract,
+                safe_pairing_payload_schema_version(data),
+                "unsupported_protocol_version"
+            )
             self._json(426, {"error": "unsupported_protocol_version"})
             return
 
@@ -1223,6 +1283,12 @@ class Handler(BaseHTTPRequestHandler):
         device_id = opaque_e2ee_identifier(data.get("device_id"))
         device_public_key = normalized_e2ee_public_key(data.get("device_public_key"))
         if not home_id or not device_id or not device_public_key:
+            log_e2ee_pairing_rejection(
+                "e2eePair",
+                header_contract,
+                safe_pairing_payload_schema_version(data),
+                "invalid_pairing_request"
+            )
             self._json(400, {"error": "invalid_pairing_request"})
             return
 
@@ -1230,6 +1296,12 @@ class Handler(BaseHTTPRequestHandler):
         pairings = read_e2ee_pairings()
         existing = pairings.get("devices", {}).get(device_id)
         if existing and existing.get("status") == "revoked":
+            log_e2ee_pairing_rejection(
+                "e2eePair",
+                header_contract,
+                safe_pairing_payload_schema_version(data),
+                "device_revoked"
+            )
             self._json(403, {"error": "device_revoked"})
             return
 
@@ -1428,7 +1500,7 @@ class Handler(BaseHTTPRequestHandler):
             return False
         if self.path.startswith(SIGNED_REMOTE_PREFIX):
             return False
-        if self.path == HOME_PROFILE_PATH:
+        if is_home_profile_path(self.path):
             return False
 
         return False
@@ -2974,7 +3046,7 @@ def log_e2ee_pairing_store_loaded():
     pairings = read_e2ee_pairings()
     count = len(pairings.get("devices", {}))
     print(
-        f"[SOSYNC-E2EE-COMPANION] pairingStoreLoaded count={count} storage=/data/besmart_e2ee_pairings.json",
+        f"[SOSYNC-E2EE-COMPANION] pairingStoreLoaded count={count} storage=/data/sosync_e2ee_pairings.json",
         flush=True
     )
 
@@ -3002,14 +3074,14 @@ def has_local_e2ee_pairing_authorization(headers):
     expected = str(authorization.get("token") or "").strip()
     expires_at = authorization.get("expires_at")
     expected_fingerprint = token_fingerprint(expected)
-    received = str(headers.get("X-SoSync-Local-Pairing-Token") or "").strip()
+    header_contract, received = local_pairing_token_contract(headers)
     received_fingerprint = token_fingerprint(received)
     expires_parse = parse_iso_epoch(expires_at)
     now_epoch = int(time.time())
     expires_epoch = int(expires_parse[1]) if expires_parse[1] is not None else 0
     expired = bool(expires_parse[0] and expires_epoch <= now_epoch)
     print(f"[SOSYNC-E2EE] companionRuntimeAuthorization observed={bool(expected)} tokenFingerprint={expected_fingerprint}", flush=True)
-    print(f"[SOSYNC-E2EE-COMPANION] pairingAuth configured=true tokenFingerprint={expected_fingerprint} headerFingerprint={received_fingerprint} expiresAt=present", flush=True)
+    print(f"[SOSYNC-E2EE-COMPANION] pairingAuth configured=true tokenFingerprint={expected_fingerprint} headerFingerprint={received_fingerprint} headerContract={header_contract} expiresAt=present", flush=True)
     print(f"[SOSYNC-E2EE-COMPANION] pairingAuth expiresParseSuccess={expires_parse[0]} expiresEpoch={expires_epoch} nowEpoch={now_epoch} expired={expired}", flush=True)
     if not expected:
         print("[SOSYNC-E2EE-COMPANION] pairingAuth tokenMatch=false expired=false rejectionReason=missingConfig", flush=True)
@@ -3405,7 +3477,7 @@ def read_consumed_packages():
 
 
 def read_backend_public_key():
-    configured = os.environ.get("BESMART_BACKEND_SIGNING_PUBLIC_KEY", "").strip()
+    configured = os.environ.get("SOSYNC_BACKEND_SIGNING_PUBLIC_KEY", "").strip()
     if configured:
         return configured
 
@@ -3873,7 +3945,7 @@ def cloudflared_runtime_status():
         companion_perf_log("cloudflaredRuntimeCacheHit")
         return dict(CLOUDFLARED_RUNTIME_STATUS_CACHE)
     started_at = time.monotonic()
-    cloudflared_binary = os.environ.get("BESMART_CLOUDFLARED_BIN", "cloudflared")
+    cloudflared_binary = os.environ.get("SOSYNC_CLOUDFLARED_BIN", "cloudflared")
     resolved = shutil.which(cloudflared_binary)
     if not resolved:
         status = {"available": False, "path": None, "version": None}
@@ -3931,11 +4003,11 @@ def remove_secure_file(path):
 
 
 def secure_remote_tunnel_token_file():
-    return os.path.join(os.path.dirname(SECURE_REMOTE_BINDING_FILE), "besmart_secure_remote_tunnel_token")
+    return os.path.join(os.path.dirname(SECURE_REMOTE_BINDING_FILE), "sosync_secure_remote_tunnel_token")
 
 
 def secure_remote_tunnel_stderr_file():
-    return os.path.join(os.path.dirname(SECURE_REMOTE_BINDING_FILE), "besmart_secure_remote_cloudflared_stderr.log")
+    return os.path.join(os.path.dirname(SECURE_REMOTE_BINDING_FILE), "sosync_secure_remote_cloudflared_stderr.log")
 
 
 def read_secure_remote_tunnel_stderr_excerpt(limit=1024):
@@ -4009,7 +4081,7 @@ def start_secure_remote_tunnel(binding=None):
             flush=True
         )
         return {"running": True, "connector_healthy": connector_status["connector_healthy"], "stage": "connectorHealthy" if connector_status["connector_healthy"] else "connectorStarting", "reason": None if connector_status["connector_healthy"] else connector_status["last_error_class"]}
-    cloudflared_binary = os.environ.get("BESMART_CLOUDFLARED_BIN", "cloudflared")
+    cloudflared_binary = os.environ.get("SOSYNC_CLOUDFLARED_BIN", "cloudflared")
     cloudflared_path = shutil.which(cloudflared_binary)
     if cloudflared_path is None:
         with timed_lock(SECURE_REMOTE_TUNNEL_LOCK, "secureRemoteTunnel", log_threshold_ms=5):
@@ -4270,7 +4342,7 @@ def is_expired_iso(value):
 def sanitize_hostname(value):
     hostname = re.sub(r"[^a-zA-Z0-9-]", "-", str(value or "").strip().lower())
     hostname = re.sub(r"-+", "-", hostname).strip("-")
-    return hostname[:63] or "besmart-home"
+    return hostname[:63] or "sosync-home"
 
 
 def store_ha_upstream(url):
@@ -4394,7 +4466,7 @@ def main():
             flush=True
         )
         raise
-    print(f"BeSmart Companion listening on port {PORT}")
+    print(f"SoSync Companion listening on port {PORT}")
     print(f"[SOSYNC-E2EE-COMPANION] runtimeListening runtimeInstance={RUNTIME_INSTANCE_ID} port={PORT}", flush=True)
     print(
         f"[SOSYNC-COMPANION-LISTENER] state=listening bindAddress={bind_address} port={PORT} runtimeInstance={RUNTIME_INSTANCE_ID} reason=serveForeverStarting",

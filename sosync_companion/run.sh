@@ -2,12 +2,12 @@
 
 set -e
 
-echo "Starting BeSmart Companion..."
+echo "Starting SoSync Companion..."
 
 mkdir -p /data/cloudflared
 
-if [ -z "${BESMART_BACKEND_SIGNING_PUBLIC_KEY:-}" ] && [ -f /data/options.json ]; then
-  BESMART_BACKEND_SIGNING_PUBLIC_KEY="$(python3 - <<'PY'
+if [ -z "${SOSYNC_BACKEND_SIGNING_PUBLIC_KEY:-}" ] && [ -f /data/options.json ]; then
+  SOSYNC_BACKEND_SIGNING_PUBLIC_KEY="$(python3 - <<'PY'
 import json
 
 try:
@@ -17,16 +17,16 @@ except Exception:
     print("")
 PY
 )"
-  export BESMART_BACKEND_SIGNING_PUBLIC_KEY
+  export SOSYNC_BACKEND_SIGNING_PUBLIC_KEY
 fi
 
-if [ -n "${BESMART_BACKEND_SIGNING_PUBLIC_KEY:-}" ]; then
+if [ -n "${SOSYNC_BACKEND_SIGNING_PUBLIC_KEY:-}" ]; then
   echo "Backend signing public key configured."
 else
   echo "Backend signing public key not configured."
 fi
 
-echo "Starting BeSmart API on port 8765..."
+echo "Starting SoSync API on port 8765..."
 
 exec python3 -u - <<'PY'
 import runpy

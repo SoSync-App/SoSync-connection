@@ -1,4 +1,4 @@
-name: Publish BeSmart Companion
+name: Publish SoSync Companion
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: besmarthome/besmart-companion
+  IMAGE_NAME: sosync-app/sosync-connection
 
 jobs:
   build-and-publish:
@@ -42,7 +42,7 @@ jobs:
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             VERSION="${GITHUB_REF_NAME}"
           else
-            VERSION=$(grep '^version:' besmart_companion/config.yaml | sed 's/version:[[:space:]]*//' | tr -d '"')
+            VERSION=$(grep '^version:' sosync_companion/config.yaml | sed 's/version:[[:space:]]*//' | tr -d '"')
           fi
 
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
@@ -51,8 +51,8 @@ jobs:
       - name: Build and push multi-arch image
         uses: docker/build-push-action@v6
         with:
-          context: ./besmart_companion
-          file: ./besmart_companion/Dockerfile
+          context: ./sosync_companion
+          file: ./sosync_companion/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |

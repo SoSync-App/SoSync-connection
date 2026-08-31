@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat,
 from cryptography.exceptions import InvalidSignature
 
 import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "besmart_companion"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "sosync_companion"))
 import app
 
 
@@ -26,10 +26,10 @@ class CompanionP03Tests(unittest.TestCase):
         self.data_dir = self.tmp.name
         self._patch_paths(self.data_dir)
         app.SECURE_REMOTE_DATAPLANE_SESSIONS.clear()
-        os.environ.pop("BESMART_BACKEND_SIGNING_PUBLIC_KEY", None)
+        os.environ.pop("SOSYNC_BACKEND_SIGNING_PUBLIC_KEY", None)
 
     def tearDown(self):
-        os.environ.pop("BESMART_BACKEND_SIGNING_PUBLIC_KEY", None)
+        os.environ.pop("SOSYNC_BACKEND_SIGNING_PUBLIC_KEY", None)
         self.tmp.cleanup()
 
     def test_legacy_state_is_preserved_by_identity_creation(self):
@@ -125,6 +125,29 @@ class CompanionP03Tests(unittest.TestCase):
         options = json.loads(Path(app.ADDON_OPTIONS_FILE).read_text(encoding="utf-8"))
         self.assertNotIn("e2ee_pairing_authorization", options)
 
+    def test_e2ee_pair_accepts_legacy_local_pairing_header_at_protocol_boundary(self):
+        device_private = x25519.X25519PrivateKey.generate()
+        device_public = app.base64url_encode(device_private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
+        self._write_options({
+            "e2ee_pairing_authorization": {
+                "token": "local-pairing-token",
+                "expires_at": app.iso_from_now(120)
+            }
+        })
+
+        with self._server() as base_url:
+            status, body = self._request_json("POST", base_url, "/security/e2ee/pair", {
+                "protocol_version": 1,
+                "home_id": "11111111-1111-4111-8111-111111111111",
+                "device_id": "33333333-3333-4333-8333-333333333333",
+                "device_public_key": device_public,
+                "key_version": 1
+            }, headers={"X-BeSmart-Local-Pairing-Token": "local-pairing-token"})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "active")
+        self.assertEqual(body["device_id"], "33333333-3333-4333-8333-333333333333")
+
     def test_e2ee_pair_authorization_rejects_expired_token(self):
         device_private = x25519.X25519PrivateKey.generate()
         device_public = app.base64url_encode(device_private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
@@ -148,16 +171,16 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertEqual(body["error"], "local_pairing_authorization_required")
 
     def test_addon_package_metadata_exposes_next_version_and_e2ee_schema(self):
-        addon_root = Path(__file__).resolve().parents[1] / "besmart_companion"
+        addon_root = Path(__file__).resolve().parents[1] / "sosync_companion"
         config = (addon_root / "config.yaml").read_text(encoding="utf-8")
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.35"', config)
+        self.assertIn('version: "1.0.41"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
-        self.assertIn("BESMART_CLOUDFLARED_BIN=/usr/local/bin/cloudflared", dockerfile)
+        self.assertIn("SOSYNC_CLOUDFLARED_BIN=/usr/local/bin/cloudflared", dockerfile)
         self.assertNotIn("tailscale", dockerfile.lower())
         self.assertIn("ARG SOSYNC_COMPANION_VERSION", dockerfile)
         self.assertIn("ARG SOSYNC_COMPANION_BUILD", dockerfile)
@@ -294,7 +317,7 @@ class CompanionP03Tests(unittest.TestCase):
                 "GET",
                 base_url,
                 "/remote/ha/api/states",
-                headers={"X-BeSmart-Remote-Token": "expected-token"}
+                headers={"X-SoSync-Remote-Token": "expected-token"}
             )
 
         self.assertEqual(unauthorized, 410)
@@ -370,7 +393,7 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertEqual(health_status, 200)
         self.assertEqual(health["protocol_version"], 1)
         self.assertEqual(health["status"], "ok")
-        self.assertEqual(health["service"], "besmart-companion-secure-remote")
+        self.assertEqual(health["service"], "sosync-companion-secure-remote")
         self.assertEqual(health["tunnel_state"], "active")
         self.assertIn("route_id_fingerprint", health)
         self.assertIn("tunnel_binding_fingerprint", health)
@@ -733,12 +756,11 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("[SOSYNC-E2EE-SESSION-TIMING] requestID=", logs)
         for stage in (
             "afterOriginValidation",
-            "bodyParseStarted",
             "bodyParseCompleted",
             "pairingFileReadStarted",
             "pairingFileReadCompleted",
-            "identityLockWaitStarted",
-            "identityLockAcquired",
+            "identityLookupStarted",
+            "identityLookupCompleted",
             "cryptoKeyDerivationStarted",
             "cryptoKeyDerivationCompleted",
             "dataplaneSessionLockWaitStarted",
@@ -1519,18 +1541,18 @@ class CompanionP03Tests(unittest.TestCase):
 
     def _patch_paths(self, data_dir):
         app.DATA_DIR = data_dir
-        app.REMOTE_TOKEN_FILE = os.path.join(data_dir, "besmart_remote_token")
-        app.HA_UPSTREAM_FILE = os.path.join(data_dir, "besmart_ha_upstream")
-        app.SERVER_ID_FILE = os.path.join(data_dir, "besmart_server_id")
-        app.REMOTE_URL_FILE = os.path.join(data_dir, "besmart_remote_url")
-        app.HOME_PROFILE_FILE = os.path.join(data_dir, "besmart_home_profile.json")
+        app.REMOTE_TOKEN_FILE = os.path.join(data_dir, "sosync_remote_token")
+        app.HA_UPSTREAM_FILE = os.path.join(data_dir, "sosync_ha_upstream")
+        app.SERVER_ID_FILE = os.path.join(data_dir, "sosync_server_id")
+        app.REMOTE_URL_FILE = os.path.join(data_dir, "sosync_remote_url")
+        app.HOME_PROFILE_FILE = os.path.join(data_dir, "sosync_home_profile.json")
         app.ADDON_OPTIONS_FILE = os.path.join(data_dir, "options.json")
-        app.COMPANION_IDENTITY_FILE = os.path.join(data_dir, "besmart_companion_identity.json")
-        app.PAIRINGS_FILE = os.path.join(data_dir, "besmart_pairings.json")
-        app.E2EE_IDENTITY_FILE = os.path.join(data_dir, "besmart_e2ee_identity.json")
-        app.E2EE_PAIRINGS_FILE = os.path.join(data_dir, "besmart_e2ee_pairings.json")
-        app.SECURE_REMOTE_BINDING_FILE = os.path.join(data_dir, "besmart_secure_remote_binding.json")
-        app.CONSUMED_PACKAGES_FILE = os.path.join(data_dir, "besmart_consumed_setup_packages.json")
+        app.COMPANION_IDENTITY_FILE = os.path.join(data_dir, "sosync_companion_identity.json")
+        app.PAIRINGS_FILE = os.path.join(data_dir, "sosync_pairings.json")
+        app.E2EE_IDENTITY_FILE = os.path.join(data_dir, "sosync_e2ee_identity.json")
+        app.E2EE_PAIRINGS_FILE = os.path.join(data_dir, "sosync_e2ee_pairings.json")
+        app.SECURE_REMOTE_BINDING_FILE = os.path.join(data_dir, "sosync_secure_remote_binding.json")
+        app.CONSUMED_PACKAGES_FILE = os.path.join(data_dir, "sosync_consumed_setup_packages.json")
 
     def _patch_cloudflared_start(self, running=False, missing=False, stderr_message="", captured=None, raise_start=False):
         self._original_shutil_which = app.shutil.which
