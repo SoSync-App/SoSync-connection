@@ -125,6 +125,100 @@ class CompanionP03Tests(unittest.TestCase):
         options = json.loads(Path(app.ADDON_OPTIONS_FILE).read_text(encoding="utf-8"))
         self.assertNotIn("e2ee_pairing_authorization", options)
 
+    def test_e2ee_pair_accepts_protocol_1_sosync_home_identity(self):
+        device_private = x25519.X25519PrivateKey.generate()
+        device_public = app.base64url_encode(device_private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
+        home_id = "home_" + ("A" * 43)
+        self._write_options({
+            "e2ee_pairing_authorization": {
+                "token": "local-pairing-token",
+                "expires_at": app.iso_from_now(120)
+            }
+        })
+
+        with self._server() as base_url:
+            status, body = self._request_json("POST", base_url, "/security/e2ee/pair", {
+                "protocol_version": 1,
+                "home_id": home_id,
+                "device_id": "44444444-4444-4444-8444-444444444444",
+                "device_public_key": device_public,
+                "key_version": 1
+            }, headers={"X-SoSync-Local-Pairing-Token": "local-pairing-token"})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["home_id"], home_id)
+        self.assertEqual(body["status"], "active")
+
+    def test_e2ee_pair_validation_reports_missing_required_field(self):
+        home_id, device_id, device_public_key, missing, invalid, decoded_public_key_bytes = app.validate_e2ee_pairing_request({
+            "protocol_version": 1,
+            "home_id": "11111111-1111-4111-8111-111111111111",
+            "device_id": "22222222-2222-4222-8222-222222222222"
+        })
+
+        self.assertEqual(home_id, "11111111-1111-4111-8111-111111111111")
+        self.assertEqual(device_id, "22222222-2222-4222-8222-222222222222")
+        self.assertEqual(device_public_key, "")
+        self.assertEqual(missing, ["device_public_key"])
+        self.assertEqual(invalid, [])
+        self.assertEqual(decoded_public_key_bytes, 0)
+
+    def test_e2ee_pair_validation_reports_wrong_public_key_encoding(self):
+        home_id, device_id, device_public_key, missing, invalid, decoded_public_key_bytes = app.validate_e2ee_pairing_request({
+            "protocol_version": 1,
+            "home_id": "11111111-1111-4111-8111-111111111111",
+            "device_id": "22222222-2222-4222-8222-222222222222",
+            "device_public_key": "not-valid-base64url"
+        })
+
+        self.assertEqual(home_id, "11111111-1111-4111-8111-111111111111")
+        self.assertEqual(device_id, "22222222-2222-4222-8222-222222222222")
+        self.assertEqual(device_public_key, "")
+        self.assertEqual(missing, [])
+        self.assertEqual(invalid, ["device_public_key"])
+        self.assertEqual(decoded_public_key_bytes, 14)
+
+    def test_e2ee_pair_validation_reports_invalid_public_key_alphabet(self):
+        home_id, device_id, device_public_key, missing, invalid, decoded_public_key_bytes = app.validate_e2ee_pairing_request({
+            "protocol_version": 1,
+            "home_id": "11111111-1111-4111-8111-111111111111",
+            "device_id": "22222222-2222-4222-8222-222222222222",
+            "device_public_key": "not+base64url"
+        })
+
+        self.assertEqual(home_id, "11111111-1111-4111-8111-111111111111")
+        self.assertEqual(device_id, "22222222-2222-4222-8222-222222222222")
+        self.assertEqual(device_public_key, "")
+        self.assertEqual(missing, [])
+        self.assertEqual(invalid, ["device_public_key"])
+        self.assertEqual(decoded_public_key_bytes, "invalidAlphabet")
+
+    def test_e2ee_pair_with_valid_token_and_malformed_body_returns_400(self):
+        self._write_options({
+            "e2ee_pairing_authorization": {
+                "token": "local-pairing-token",
+                "expires_at": app.iso_from_now(120)
+            }
+        })
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            with self._server() as base_url:
+                status, body = self._request_json("POST", base_url, "/security/e2ee/pair", {
+                    "protocol_version": 1,
+                    "home_id": "11111111-1111-4111-8111-111111111111",
+                    "device_id": "22222222-2222-4222-8222-222222222222",
+                    "device_public_key": "not-valid-base64url"
+                }, headers={"X-SoSync-Local-Pairing-Token": "local-pairing-token"})
+
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_pairing_request")
+        diagnostics = output.getvalue()
+        self.assertIn("e2eePairValidation result=rejected reason=invalid_field", diagnostics)
+        self.assertIn("invalidFields=device_public_key", diagnostics)
+        self.assertIn("decodedPublicKeyBytes=14", diagnostics)
+        self.assertIn("tokenAuthorized=true", diagnostics)
+
     def test_e2ee_pair_accepts_legacy_local_pairing_header_at_protocol_boundary(self):
         device_private = x25519.X25519PrivateKey.generate()
         device_public = app.base64url_encode(device_private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
@@ -176,7 +270,7 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.41"', config)
+        self.assertIn('version: "1.0.42"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
@@ -193,6 +287,7 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("tunnelProcessStarted", runtime)
         self.assertIn("tunnelProcessFailed", runtime)
         self.assertIn("SOSYNC_COMPANION_BUILD", runtime)
+        self.assertIn("companionBuild marker=", runtime)
 
     def test_health_and_identity_expose_runtime_build_marker(self):
         with self._server() as base_url:

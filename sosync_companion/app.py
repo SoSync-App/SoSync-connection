@@ -114,6 +114,10 @@ print(
     f"[SOSYNC-E2EE-COMPANION] runtimeGlobalsInitialized runtimeInstance={RUNTIME_INSTANCE_ID} build={SOSYNC_COMPANION_BUILD}",
     flush=True
 )
+print(
+    f"[SOSYNC-E2EE-COMPANION] companionBuild marker={SOSYNC_COMPANION_BUILD} version={SOSYNC_COMPANION_VERSION}",
+    flush=True
+)
 
 
 def companion_path_class(path):
@@ -166,13 +170,43 @@ def safe_pairing_payload_schema_version(data):
     return "unknown"
 
 
-def log_e2ee_pairing_rejection(path_class, header_contract, payload_schema_version, rejection_class):
+def log_e2ee_pairing_rejection(
+    path_class,
+    header_contract,
+    payload_schema_version,
+    rejection_class,
+    missing_fields=None,
+    invalid_fields=None,
+    decoded_public_key_bytes="unknown",
+    token_authorized=False,
+    home_binding_matches="unknown",
+):
+    missing_fields = missing_fields or []
+    invalid_fields = invalid_fields or []
+    token_authorized_value = str(bool(token_authorized)).lower()
     print(
         "[SOSYNC-E2EE-COMPANION] pairingRequestRejected "
         f"pathClass={path_class} "
         f"headerContract={header_contract} "
         f"payloadSchemaVersion={payload_schema_version} "
-        f"rejectionClass={rejection_class}",
+        f"rejectionClass={rejection_class} "
+        f"missingFields={','.join(missing_fields) or 'none'} "
+        f"invalidFields={','.join(invalid_fields) or 'none'} "
+        f"decodedPublicKeyBytes={decoded_public_key_bytes} "
+        f"tokenAuthorized={token_authorized_value} "
+        f"homeBindingMatches={home_binding_matches}",
+        flush=True
+    )
+    print(
+        "[SOSYNC-E2EE-COMPANION] e2eePairValidation "
+        f"result=rejected "
+        f"reason={rejection_class} "
+        f"missingFields={','.join(missing_fields) or 'none'} "
+        f"invalidFields={','.join(invalid_fields) or 'none'} "
+        f"schemaVersion={payload_schema_version} "
+        f"decodedPublicKeyBytes={decoded_public_key_bytes} "
+        f"tokenAuthorized={token_authorized_value} "
+        f"homeBindingMatches={home_binding_matches}",
         flush=True
     )
 
@@ -1252,7 +1286,8 @@ class Handler(BaseHTTPRequestHandler):
                 "e2eePair",
                 header_contract,
                 "unknown",
-                "local_pairing_authorization_required"
+                "local_pairing_authorization_required",
+                token_authorized=False
             )
             self._json(401, {"error": "local_pairing_authorization_required"})
             return
@@ -1264,30 +1299,64 @@ class Handler(BaseHTTPRequestHandler):
                 "e2eePair",
                 header_contract,
                 "unknown",
-                "json_decode_failure"
+                "json_decode_failure",
+                token_authorized=True
             )
             self._json(400, {"error": str(error)})
             return
 
-        if data.get("protocol_version") != E2EE_PROTOCOL_VERSION:
+        if not isinstance(data, dict):
             log_e2ee_pairing_rejection(
                 "e2eePair",
                 header_contract,
                 safe_pairing_payload_schema_version(data),
-                "unsupported_protocol_version"
+                "body_not_json_object",
+                invalid_fields=["body"],
+                token_authorized=True
+            )
+            self._json(400, {"error": "invalid_pairing_request"})
+            return
+
+        protocol_version = data.get("protocol_version")
+        if not isinstance(protocol_version, int):
+            missing = ["protocol_version"] if protocol_version is None else []
+            invalid = [] if protocol_version is None else ["protocol_version"]
+            log_e2ee_pairing_rejection(
+                "e2eePair",
+                header_contract,
+                safe_pairing_payload_schema_version(data),
+                "missing_protocol_version" if missing else "invalid_protocol_version",
+                missing_fields=missing,
+                invalid_fields=invalid,
+                token_authorized=True
+            )
+            self._json(400, {"error": "invalid_pairing_request"})
+            return
+
+        if protocol_version != E2EE_PROTOCOL_VERSION:
+            log_e2ee_pairing_rejection(
+                "e2eePair",
+                header_contract,
+                safe_pairing_payload_schema_version(data),
+                "unsupported_protocol_version",
+                invalid_fields=["protocol_version"],
+                token_authorized=True
             )
             self._json(426, {"error": "unsupported_protocol_version"})
             return
 
-        home_id = opaque_e2ee_identifier(data.get("home_id"))
-        device_id = opaque_e2ee_identifier(data.get("device_id"))
-        device_public_key = normalized_e2ee_public_key(data.get("device_public_key"))
-        if not home_id or not device_id or not device_public_key:
+        home_id, device_id, device_public_key, missing_fields, invalid_fields, decoded_public_key_bytes = validate_e2ee_pairing_request(data)
+        if missing_fields or invalid_fields:
+            rejection_class = "missing_required_field" if missing_fields else "invalid_field"
             log_e2ee_pairing_rejection(
                 "e2eePair",
                 header_contract,
                 safe_pairing_payload_schema_version(data),
-                "invalid_pairing_request"
+                rejection_class,
+                missing_fields=missing_fields,
+                invalid_fields=invalid_fields,
+                decoded_public_key_bytes=decoded_public_key_bytes,
+                token_authorized=True
             )
             self._json(400, {"error": "invalid_pairing_request"})
             return
@@ -1300,7 +1369,10 @@ class Handler(BaseHTTPRequestHandler):
                 "e2eePair",
                 header_contract,
                 safe_pairing_payload_schema_version(data),
-                "device_revoked"
+                "device_revoked",
+                decoded_public_key_bytes=decoded_public_key_bytes,
+                token_authorized=True,
+                home_binding_matches=str(existing.get("home_id") == home_id).lower() if isinstance(existing, dict) else "unknown"
             )
             self._json(403, {"error": "device_revoked"})
             return
@@ -3214,6 +3286,59 @@ def opaque_e2ee_identifier(value):
     if re.fullmatch(r"[0-9A-Fa-f-]{16,64}", candidate):
         return candidate
     return ""
+
+
+def opaque_e2ee_home_identifier(value):
+    candidate = str(value or "").strip()
+    if re.fullmatch(r"[0-9A-Fa-f-]{16,64}", candidate):
+        return candidate
+    if re.fullmatch(r"home_[A-Za-z0-9_-]{32,96}", candidate):
+        return candidate
+    if re.fullmatch(r"[A-Za-z0-9_-]{32,128}", candidate):
+        return candidate
+    return ""
+
+
+def validate_e2ee_pairing_request(data):
+    missing_fields = []
+    invalid_fields = []
+    if not isinstance(data, dict):
+        return ("", "", "", ["body"], [], "unknown")
+
+    raw_home_id = data.get("home_id")
+    raw_device_id = data.get("device_id")
+    raw_device_public_key = data.get("device_public_key")
+    for field, value in (
+        ("home_id", raw_home_id),
+        ("device_id", raw_device_id),
+        ("device_public_key", raw_device_public_key),
+    ):
+        if str(value or "").strip() == "":
+            missing_fields.append(field)
+
+    decoded_public_key_bytes = e2ee_public_key_decoded_byte_count(raw_device_public_key)
+    home_id = opaque_e2ee_home_identifier(raw_home_id)
+    device_id = opaque_e2ee_identifier(raw_device_id)
+    device_public_key = normalized_e2ee_public_key(raw_device_public_key)
+    if raw_home_id is not None and not home_id:
+        invalid_fields.append("home_id")
+    if raw_device_id is not None and not device_id:
+        invalid_fields.append("device_id")
+    if raw_device_public_key is not None and not device_public_key:
+        invalid_fields.append("device_public_key")
+    return (home_id, device_id, device_public_key, missing_fields, invalid_fields, decoded_public_key_bytes)
+
+
+def e2ee_public_key_decoded_byte_count(value):
+    candidate = str(value or "").strip()
+    if not candidate:
+        return 0
+    if not re.fullmatch(r"[A-Za-z0-9_-]+={0,2}", candidate):
+        return "invalidAlphabet"
+    try:
+        return len(base64url_decode(candidate))
+    except Exception:
+        return "decodeFailed"
 
 
 def e2ee_public_key_normalization_checkpoint(stage, request_id, timing_started_at, operation_started_at, input_length=0, decoded_length=0, valid=None, **fields):
