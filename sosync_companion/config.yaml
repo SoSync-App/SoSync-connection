@@ -1,7 +1,7 @@
 name: "SoSync Companion"
 slug: "sosync_companion"
 description: "Local setup companion for SoSync Home Server"
-version: "1.0.42"
+version: "1.0.43"
 
 arch:
   - aarch64

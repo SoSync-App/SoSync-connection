@@ -179,6 +179,7 @@ def log_e2ee_pairing_rejection(
     invalid_fields=None,
     decoded_public_key_bytes="unknown",
     token_authorized=False,
+    syntactically_valid_home_id="unknown",
     home_binding_matches="unknown",
 ):
     missing_fields = missing_fields or []
@@ -194,6 +195,7 @@ def log_e2ee_pairing_rejection(
         f"invalidFields={','.join(invalid_fields) or 'none'} "
         f"decodedPublicKeyBytes={decoded_public_key_bytes} "
         f"tokenAuthorized={token_authorized_value} "
+        f"syntacticallyValidHomeID={syntactically_valid_home_id} "
         f"homeBindingMatches={home_binding_matches}",
         flush=True
     )
@@ -206,6 +208,27 @@ def log_e2ee_pairing_rejection(
         f"schemaVersion={payload_schema_version} "
         f"decodedPublicKeyBytes={decoded_public_key_bytes} "
         f"tokenAuthorized={token_authorized_value} "
+        f"syntacticallyValidHomeID={syntactically_valid_home_id} "
+        f"homeBindingMatches={home_binding_matches}",
+        flush=True
+    )
+
+
+def log_e2ee_pairing_acceptance(
+    payload_schema_version,
+    decoded_public_key_bytes,
+    home_binding_matches,
+):
+    print(
+        "[SOSYNC-E2EE-COMPANION] e2eePairValidation "
+        "result=accepted "
+        "reason=validated "
+        "missingFields=none "
+        "invalidFields=none "
+        f"schemaVersion={payload_schema_version} "
+        f"decodedPublicKeyBytes={decoded_public_key_bytes} "
+        "tokenAuthorized=true "
+        "syntacticallyValidHomeID=true "
         f"homeBindingMatches={home_binding_matches}",
         flush=True
     )
@@ -1348,6 +1371,7 @@ class Handler(BaseHTTPRequestHandler):
         home_id, device_id, device_public_key, missing_fields, invalid_fields, decoded_public_key_bytes = validate_e2ee_pairing_request(data)
         if missing_fields or invalid_fields:
             rejection_class = "missing_required_field" if missing_fields else "invalid_field"
+            syntactically_valid_home_id = "false" if "home_id" in missing_fields or "home_id" in invalid_fields else "true"
             log_e2ee_pairing_rejection(
                 "e2eePair",
                 header_contract,
@@ -1356,7 +1380,8 @@ class Handler(BaseHTTPRequestHandler):
                 missing_fields=missing_fields,
                 invalid_fields=invalid_fields,
                 decoded_public_key_bytes=decoded_public_key_bytes,
-                token_authorized=True
+                token_authorized=True,
+                syntactically_valid_home_id=syntactically_valid_home_id
             )
             self._json(400, {"error": "invalid_pairing_request"})
             return
@@ -1364,6 +1389,21 @@ class Handler(BaseHTTPRequestHandler):
         identity = ensure_e2ee_identity()
         pairings = read_e2ee_pairings()
         existing = pairings.get("devices", {}).get(device_id)
+        if isinstance(existing, dict) and existing.get("status") != "revoked":
+            home_binding_matches = existing.get("home_id") == home_id
+            if not home_binding_matches:
+                log_e2ee_pairing_rejection(
+                    "e2eePair",
+                    header_contract,
+                    safe_pairing_payload_schema_version(data),
+                    "home_binding_mismatch",
+                    decoded_public_key_bytes=decoded_public_key_bytes,
+                    token_authorized=True,
+                    syntactically_valid_home_id="true",
+                    home_binding_matches="false"
+                )
+                self._json(409, {"error": "invalid_pairing_request"})
+                return
         if existing and existing.get("status") == "revoked":
             log_e2ee_pairing_rejection(
                 "e2eePair",
@@ -1372,10 +1412,17 @@ class Handler(BaseHTTPRequestHandler):
                 "device_revoked",
                 decoded_public_key_bytes=decoded_public_key_bytes,
                 token_authorized=True,
+                syntactically_valid_home_id="true",
                 home_binding_matches=str(existing.get("home_id") == home_id).lower() if isinstance(existing, dict) else "unknown"
             )
             self._json(403, {"error": "device_revoked"})
             return
+
+        log_e2ee_pairing_acceptance(
+            safe_pairing_payload_schema_version(data),
+            decoded_public_key_bytes,
+            "true" if isinstance(existing, dict) else "notApplicable"
+        )
 
         record = make_e2ee_pairing_record(
             home_id=home_id,
@@ -3288,8 +3335,10 @@ def opaque_e2ee_identifier(value):
     return ""
 
 
-def opaque_e2ee_home_identifier(value):
+def canonical_e2ee_home_identifier(value):
     candidate = str(value or "").strip()
+    if re.fullmatch(r"srv_[0-9a-f]{12}", candidate):
+        return candidate
     if re.fullmatch(r"[0-9A-Fa-f-]{16,64}", candidate):
         return candidate
     if re.fullmatch(r"home_[A-Za-z0-9_-]{32,96}", candidate):
@@ -3297,6 +3346,10 @@ def opaque_e2ee_home_identifier(value):
     if re.fullmatch(r"[A-Za-z0-9_-]{32,128}", candidate):
         return candidate
     return ""
+
+
+def opaque_e2ee_home_identifier(value):
+    return canonical_e2ee_home_identifier(value)
 
 
 def validate_e2ee_pairing_request(data):

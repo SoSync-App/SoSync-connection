@@ -57,7 +57,7 @@ jobs:
           push: true
           build-args: |
             SOSYNC_COMPANION_VERSION=${{ steps.version.outputs.version }}
-            SOSYNC_COMPANION_BUILD=p2_e_pair_validator_20260901_v11
+            SOSYNC_COMPANION_BUILD=p2_e_home_identity_contract_20260901_v12
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest

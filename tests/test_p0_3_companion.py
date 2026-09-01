@@ -128,7 +128,7 @@ class CompanionP03Tests(unittest.TestCase):
     def test_e2ee_pair_accepts_protocol_1_sosync_home_identity(self):
         device_private = x25519.X25519PrivateKey.generate()
         device_public = app.base64url_encode(device_private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
-        home_id = "home_" + ("A" * 43)
+        home_id = "srv_abcdef123456"
         self._write_options({
             "e2ee_pairing_authorization": {
                 "token": "local-pairing-token",
@@ -149,14 +149,82 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertEqual(body["home_id"], home_id)
         self.assertEqual(body["status"], "active")
 
+    def test_e2ee_pair_rejects_malformed_home_identity(self):
+        device_private = x25519.X25519PrivateKey.generate()
+        device_public = app.base64url_encode(device_private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
+        self._write_options({
+            "e2ee_pairing_authorization": {
+                "token": "local-pairing-token",
+                "expires_at": app.iso_from_now(120)
+            }
+        })
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            with self._server() as base_url:
+                status, body = self._request_json("POST", base_url, "/security/e2ee/pair", {
+                    "protocol_version": 1,
+                    "home_id": "srv_not-valid",
+                    "device_id": "44444444-4444-4444-8444-444444444444",
+                    "device_public_key": device_public,
+                    "key_version": 1
+                }, headers={"X-SoSync-Local-Pairing-Token": "local-pairing-token"})
+
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_pairing_request")
+        diagnostics = output.getvalue()
+        self.assertIn("invalidFields=home_id", diagnostics)
+        self.assertIn("syntacticallyValidHomeID=false", diagnostics)
+        self.assertIn("homeBindingMatches=unknown", diagnostics)
+
+    def test_e2ee_pair_rejects_valid_wrong_home_as_binding_mismatch(self):
+        device_private = x25519.X25519PrivateKey.generate()
+        device_public = app.base64url_encode(device_private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
+        device_id = "44444444-4444-4444-8444-444444444444"
+        identity = app.ensure_e2ee_identity()
+        existing = app.make_e2ee_pairing_record(
+            home_id="srv_abcdef123456",
+            device_id=device_id,
+            device_public_key=device_public,
+            companion_public_key=identity["public_key"],
+            key_version=identity["key_version"]
+        )
+        app.write_json_file_secure(app.E2EE_PAIRINGS_FILE, {"devices": {device_id: existing}})
+        self._write_options({
+            "e2ee_pairing_authorization": {
+                "token": "local-pairing-token",
+                "expires_at": app.iso_from_now(120)
+            }
+        })
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            with self._server() as base_url:
+                status, body = self._request_json("POST", base_url, "/security/e2ee/pair", {
+                    "protocol_version": 1,
+                    "home_id": "srv_123456abcdef",
+                    "device_id": device_id,
+                    "device_public_key": device_public,
+                    "key_version": 1
+                }, headers={"X-SoSync-Local-Pairing-Token": "local-pairing-token"})
+
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "invalid_pairing_request")
+        diagnostics = output.getvalue()
+        self.assertIn("e2eePairValidation result=rejected reason=home_binding_mismatch", diagnostics)
+        self.assertIn("syntacticallyValidHomeID=true", diagnostics)
+        self.assertIn("homeBindingMatches=false", diagnostics)
+        stored = app.read_e2ee_pairings()["devices"][device_id]
+        self.assertEqual(stored["home_id"], "srv_abcdef123456")
+
     def test_e2ee_pair_validation_reports_missing_required_field(self):
         home_id, device_id, device_public_key, missing, invalid, decoded_public_key_bytes = app.validate_e2ee_pairing_request({
             "protocol_version": 1,
-            "home_id": "11111111-1111-4111-8111-111111111111",
+            "home_id": "srv_abcdef123456",
             "device_id": "22222222-2222-4222-8222-222222222222"
         })
 
-        self.assertEqual(home_id, "11111111-1111-4111-8111-111111111111")
+        self.assertEqual(home_id, "srv_abcdef123456")
         self.assertEqual(device_id, "22222222-2222-4222-8222-222222222222")
         self.assertEqual(device_public_key, "")
         self.assertEqual(missing, ["device_public_key"])
@@ -270,7 +338,7 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.42"', config)
+        self.assertIn('version: "1.0.43"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
