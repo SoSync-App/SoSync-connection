@@ -57,7 +57,7 @@ jobs:
           push: true
           build-args: |
             SOSYNC_COMPANION_VERSION=${{ steps.version.outputs.version }}
-            SOSYNC_COMPANION_BUILD=p2_e_secure_remote_revocation_lifecycle_20260902_v18
+            SOSYNC_COMPANION_BUILD=p2_e_home_config_api_routes_20260902_v19
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest

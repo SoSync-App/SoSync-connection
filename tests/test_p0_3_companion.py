@@ -338,7 +338,7 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.45"', config)
+        self.assertIn('version: "1.0.46"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
@@ -356,6 +356,29 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("tunnelProcessFailed", runtime)
         self.assertIn("SOSYNC_COMPANION_BUILD", runtime)
         self.assertIn("companionBuild marker=", runtime)
+        self.assertIn('HOME_CONFIGURATION_PATH = "/sosync/home-config"', runtime)
+        self.assertIn('HOME_CONFIGURATION_MUTATION_PATH = "/sosync/home-config/mutate"', runtime)
+        self.assertIn("def _handle_home_configuration_get", runtime)
+        self.assertIn("def _handle_home_configuration_create", runtime)
+        self.assertIn("def _handle_home_configuration_mutation", runtime)
+        self.assertIn("routesRegistered get=true create=true mutate=true", runtime)
+        self.assertIn('return "homeConfiguration"', runtime)
+
+    def test_home_configuration_routes_are_registered_by_production_handler(self):
+        runtime = (Path(__file__).resolve().parents[1] / "sosync_companion" / "app.py").read_text(encoding="utf-8")
+
+        self.assertIn("if is_home_configuration_path(self.path):", runtime)
+        self.assertIn("self._handle_home_configuration_get()", runtime)
+        self.assertIn("self._handle_home_configuration_create()", runtime)
+        self.assertIn("if is_home_configuration_mutation_path(self.path):", runtime)
+        self.assertIn("self._handle_home_configuration_mutation()", runtime)
+
+    def test_home_configuration_absent_document_uses_registered_get_route(self):
+        with self._server() as base_url:
+            status, body = self._request_json("GET", base_url, "/sosync/home-config?homeIdentity=stable-home-identity")
+
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"], "not_found")
 
     def test_health_and_identity_expose_runtime_build_marker(self):
         with self._server() as base_url:
@@ -1746,6 +1769,219 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("sequence", stored)
         self.assertFalse(Path(f"{app.HOME_PROFILE_FILE}.tmp").exists())
 
+    def test_home_configuration_create_and_reload_persists_authoritative_document(self):
+        with self._server() as base_url:
+            status, created = self._request_json("POST", base_url, "/sosync/home-config", {
+                "homeIdentity": "stable-home-identity"
+            })
+            get_status, loaded = self._request_json("GET", base_url, "/sosync/home-config?homeIdentity=stable-home-identity")
+
+        self.assertEqual(status, 201)
+        self.assertEqual(get_status, 200)
+        self.assertEqual(created["homeIdentity"], "stable-home-identity")
+        self.assertEqual(loaded["homeIdentity"], "stable-home-identity")
+        self.assertEqual(loaded["schemaVersion"], 1)
+        self.assertEqual(loaded["revision"], 0)
+        self.assertEqual(loaded["domainRevisions"]["dashboards"], 0)
+        self.assertNotIn("app_attest", json.dumps(loaded))
+
+        app.COMPANION_JSON_READ_CACHE.clear()
+        reloaded = app.read_home_configuration_document()
+        self.assertEqual(reloaded["homeIdentity"], "stable-home-identity")
+
+    def test_home_configuration_home_identity_mismatch_is_rejected_fail_closed(self):
+        app.create_home_configuration_if_absent("stable-home-identity")
+
+        with self._server() as base_url:
+            get_status, get_body = self._request_json("GET", base_url, "/sosync/home-config?homeIdentity=other-home")
+            create_status, create_body = self._request_json("POST", base_url, "/sosync/home-config", {
+                "homeIdentity": "other-home"
+            })
+
+        self.assertEqual(get_status, 403)
+        self.assertEqual(get_body["error"], "home_identity_mismatch")
+        self.assertEqual(create_status, 403)
+        self.assertEqual(create_body["error"], "home_identity_mismatch")
+
+    def test_home_configuration_same_domain_stale_write_is_rejected(self):
+        app.create_home_configuration_if_absent("stable-home-identity")
+
+        with self._server() as base_url:
+            first_status, first = self._request_json("POST", base_url, "/sosync/home-config/mutate", {
+                "homeIdentity": "stable-home-identity",
+                "domain": "dashboards",
+                "baseDomainRevision": 0,
+                "patch": {
+                    "dashboards": [{"id": "main"}],
+                    "dashboardOrder": ["main"],
+                    "dashboardWidgets": [{"id": "widget-main", "type": "light"}]
+                }
+            })
+            stale_status, stale = self._request_json("POST", base_url, "/sosync/home-config/mutate", {
+                "homeIdentity": "stable-home-identity",
+                "domain": "dashboards",
+                "baseDomainRevision": 0,
+                "patch": {
+                    "dashboards": [{"id": "other"}],
+                    "dashboardOrder": ["other"]
+                }
+            })
+
+        self.assertEqual(first_status, 200)
+        self.assertEqual(first["revision"], 1)
+        self.assertEqual(first["dashboardWidgets"][0]["id"], "widget-main")
+        self.assertEqual(stale_status, 409)
+        self.assertEqual(stale["error"], "revision_conflict")
+        self.assertEqual(stale["currentRevision"], 1)
+        self.assertEqual(stale["currentDomainRevision"], 1)
+
+    def test_home_configuration_dashboard_widgets_round_trip_with_exact_revisions(self):
+        app.create_home_configuration_if_absent("stable-home-identity")
+
+        with self._server() as base_url:
+            status, mutated = self._request_json("POST", base_url, "/sosync/home-config/mutate", {
+                "homeIdentity": "stable-home-identity",
+                "domain": "dashboards",
+                "baseDomainRevision": 0,
+                "patch": {
+                    "dashboards": [
+                        {"id": "dashboard-a", "name": "Home"},
+                        {"id": "dashboard-b", "name": "Upstairs"}
+                    ],
+                    "dashboardOrder": ["dashboard-b", "dashboard-a"],
+                    "dashboardWidgets": [
+                        {"id": "tile-a", "type": "light", "entityID": "light.kitchen"},
+                        {"id": "tile-b", "type": "sensor", "entityID": "sensor.power"}
+                    ]
+                }
+            })
+            get_status, loaded = self._request_json("GET", base_url, "/sosync/home-config?homeIdentity=stable-home-identity")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(get_status, 200)
+        self.assertEqual(mutated["revision"], 1)
+        self.assertEqual(mutated["domainRevisions"]["dashboards"], 1)
+        self.assertEqual(loaded["revision"], 1)
+        self.assertEqual(loaded["domainRevisions"]["dashboards"], 1)
+        self.assertEqual([dashboard["id"] for dashboard in loaded["dashboards"]], ["dashboard-a", "dashboard-b"])
+        self.assertEqual(loaded["dashboardOrder"], ["dashboard-b", "dashboard-a"])
+        self.assertEqual([widget["id"] for widget in loaded["dashboardWidgets"]], ["tile-a", "tile-b"])
+
+    def test_home_configuration_dashboard_conflict_preserves_authoritative_projection(self):
+        app.create_home_configuration_if_absent("stable-home-identity")
+
+        with self._server() as base_url:
+            first_status, first = self._request_json("POST", base_url, "/sosync/home-config/mutate", {
+                "homeIdentity": "stable-home-identity",
+                "domain": "dashboards",
+                "baseDomainRevision": 0,
+                "patch": {
+                    "dashboards": [{"id": "dashboard-a", "name": "Home"}],
+                    "dashboardOrder": ["dashboard-a"],
+                    "dashboardWidgets": [{"id": "tile-a", "type": "light"}]
+                }
+            })
+            conflict_status, conflict = self._request_json("POST", base_url, "/sosync/home-config/mutate", {
+                "homeIdentity": "stable-home-identity",
+                "domain": "dashboards",
+                "baseDomainRevision": 0,
+                "patch": {
+                    "dashboards": [{"id": "dashboard-stale", "name": "Stale"}],
+                    "dashboardOrder": ["dashboard-stale"],
+                    "dashboardWidgets": [{"id": "tile-stale", "type": "sensor"}]
+                }
+            })
+            get_status, loaded = self._request_json("GET", base_url, "/sosync/home-config?homeIdentity=stable-home-identity")
+
+        self.assertEqual(first_status, 200)
+        self.assertEqual(first["revision"], 1)
+        self.assertEqual(conflict_status, 409)
+        self.assertEqual(conflict["error"], "revision_conflict")
+        self.assertEqual(get_status, 200)
+        self.assertEqual(loaded["revision"], 1)
+        self.assertEqual(loaded["domainRevisions"]["dashboards"], 1)
+        self.assertEqual([dashboard["id"] for dashboard in loaded["dashboards"]], ["dashboard-a"])
+        self.assertEqual([widget["id"] for widget in loaded["dashboardWidgets"]], ["tile-a"])
+
+    def test_home_configuration_different_domain_write_from_older_global_revision_is_allowed(self):
+        app.create_home_configuration_if_absent("stable-home-identity")
+
+        with self._server() as base_url:
+            dashboard_status, dashboard = self._request_json("POST", base_url, "/sosync/home-config/mutate", {
+                "homeIdentity": "stable-home-identity",
+                "domain": "dashboards",
+                "baseDomainRevision": 0,
+                "patch": {
+                    "dashboards": [{"id": "main"}],
+                    "dashboardOrder": ["main"]
+                }
+            })
+            energy_status, energy = self._request_json("POST", base_url, "/sosync/home-config/mutate", {
+                "homeIdentity": "stable-home-identity",
+                "domain": "energy",
+                "baseDomainRevision": 0,
+                "patch": {
+                    "roles": {
+                        "gridImportEnergy": "sensor.grid_import"
+                    }
+                }
+            })
+
+        self.assertEqual(dashboard_status, 200)
+        self.assertEqual(energy_status, 200)
+        self.assertEqual(dashboard["revision"], 1)
+        self.assertEqual(energy["revision"], 2)
+        self.assertEqual(energy["domainRevisions"]["dashboards"], 1)
+        self.assertEqual(energy["domainRevisions"]["energy"], 1)
+
+    def test_home_configuration_domain_and_global_revision_increment_exactly_once(self):
+        app.create_home_configuration_if_absent("stable-home-identity")
+
+        mutated = app.mutate_home_configuration(
+            home_identity="stable-home-identity",
+            domain="remoteAccessPolicy",
+            base_domain_revision=0,
+            patch={"enabled": False},
+            updated_by_device_hash="device-hash"
+        )
+
+        self.assertEqual(mutated["revision"], 1)
+        self.assertEqual(mutated["domainRevisions"]["remoteAccessPolicy"], 1)
+        self.assertEqual(mutated["domainRevisions"]["dashboards"], 0)
+        self.assertFalse(mutated["remoteAccessPolicy"]["enabled"])
+        self.assertEqual(mutated["updatedByDeviceIDHash"], "device-hash")
+
+    def test_home_configuration_corrupt_persistence_fails_safely_without_overwrite(self):
+        Path(app.HOME_CONFIGURATION_FILE).write_text("{not-json", encoding="utf-8")
+
+        with self.assertRaises(app.HomeConfigurationPersistenceError):
+            app.read_home_configuration_document()
+
+        with self._server() as base_url:
+            status, body = self._request_json("POST", base_url, "/sosync/home-config", {
+                "homeIdentity": "stable-home-identity"
+            })
+
+        self.assertEqual(status, 500)
+        self.assertEqual(body["error"], "home_config_persistence_failure")
+        self.assertEqual(Path(app.HOME_CONFIGURATION_FILE).read_text(encoding="utf-8"), "{not-json")
+
+    def test_home_configuration_rejects_security_structures_in_mutation_payload(self):
+        app.create_home_configuration_if_absent("stable-home-identity")
+
+        with self._server() as base_url:
+            status, body = self._request_json("POST", base_url, "/sosync/home-config/mutate", {
+                "homeIdentity": "stable-home-identity",
+                "domain": "presentation",
+                "baseDomainRevision": 0,
+                "patch": {
+                    "access_token": "must-not-store"
+                }
+            })
+
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "prohibited_security_field")
+
     def _patch_paths(self, data_dir):
         app.DATA_DIR = data_dir
         app.REMOTE_TOKEN_FILE = os.path.join(data_dir, "sosync_remote_token")
@@ -1760,6 +1996,7 @@ class CompanionP03Tests(unittest.TestCase):
         app.E2EE_PAIRINGS_FILE = os.path.join(data_dir, "sosync_e2ee_pairings.json")
         app.SECURE_REMOTE_BINDING_FILE = os.path.join(data_dir, "sosync_secure_remote_binding.json")
         app.CONSUMED_PACKAGES_FILE = os.path.join(data_dir, "sosync_consumed_setup_packages.json")
+        app.HOME_CONFIGURATION_FILE = os.path.join(data_dir, "sosync_home_configuration.json")
 
     def _patch_cloudflared_start(self, running=False, missing=False, stderr_message="", captured=None, raise_start=False):
         self._original_shutil_which = app.shutil.which

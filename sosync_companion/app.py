@@ -57,13 +57,18 @@ SECURE_REMOTE_BINDING_FILE = os.path.join(DATA_DIR, "sosync_secure_remote_bindin
 SECURE_REMOTE_TUNNEL_TOKEN_FILE = os.path.join(DATA_DIR, "sosync_secure_remote_tunnel_token")
 SECURE_REMOTE_TUNNEL_STDERR_FILE = os.path.join(DATA_DIR, "sosync_secure_remote_cloudflared_stderr.log")
 CONSUMED_PACKAGES_FILE = os.path.join(DATA_DIR, "sosync_consumed_setup_packages.json")
+HOME_CONFIGURATION_FILE = os.path.join(DATA_DIR, "sosync_home_configuration.json")
 REMOTE_TOKEN_HEADER = "X-SoSync-Remote-Token"
 LOCAL_PAIRING_TOKEN_HEADER = "X-SoSync-Local-Pairing-Token"
 LEGACY_LOCAL_PAIRING_TOKEN_HEADER = "X-BeSmart-Local-Pairing-Token"
 HOME_PROFILE_PATH = "/sosync/home-profile"
 LEGACY_HOME_PROFILE_PATH = "/besmart/home-profile"
+HOME_CONFIGURATION_PATH = "/sosync/home-config"
+HOME_CONFIGURATION_MUTATION_PATH = "/sosync/home-config/mutate"
 MAX_HOME_PROFILE_BYTES = 512 * 1024
+MAX_HOME_CONFIGURATION_BYTES = 512 * 1024
 HOME_PROFILE_WRITE_LOCK = threading.Lock()
+HOME_CONFIGURATION_WRITE_LOCK = threading.RLock()
 PAIRING_TTL_SECONDS = 120
 E2EE_PROTOCOL_VERSION = 1
 SETUP_PACKAGE_INFO = b"sosync-remote-setup-package-v1"
@@ -138,6 +143,8 @@ def companion_path_class(path):
         return "secureRemoteControlPlane"
     if request_path.startswith("/security/e2ee"):
         return "e2eeControlPlane"
+    if is_home_configuration_path(request_path) or is_home_configuration_mutation_path(request_path):
+        return "homeConfiguration"
     if request_path.startswith("/remote/"):
         return "legacyRemoteProxy"
     return "other"
@@ -146,6 +153,16 @@ def companion_path_class(path):
 def is_home_profile_path(path):
     request_path = urlparse(path or "/").path
     return request_path in (HOME_PROFILE_PATH, LEGACY_HOME_PROFILE_PATH)
+
+
+def is_home_configuration_path(path):
+    request_path = urlparse(path or "/").path
+    return request_path == HOME_CONFIGURATION_PATH
+
+
+def is_home_configuration_mutation_path(path):
+    request_path = urlparse(path or "/").path
+    return request_path == HOME_CONFIGURATION_MUTATION_PATH
 
 
 def local_pairing_token_contract(headers):
@@ -596,6 +613,10 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_home_profile_get()
             return
 
+        if is_home_configuration_path(self.path):
+            self._handle_home_configuration_get()
+            return
+
         if self.path == "/health":
             tunnel_runtime = cloudflared_runtime_status()
             secure_remote_status = secure_remote_public_status()
@@ -819,6 +840,14 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_secure_remote_tunnel_rotate()
             return
 
+        if is_home_configuration_path(self.path):
+            self._handle_home_configuration_create()
+            return
+
+        if is_home_configuration_mutation_path(self.path):
+            self._handle_home_configuration_mutation()
+            return
+
         if self._handle_secure_remote_dataplane_request(urlparse(self.path).path):
             return
 
@@ -897,6 +926,174 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorize_secure_remote_control_plane():
             return
         self._json(200, secure_remote_public_status())
+
+    def _handle_home_configuration_get(self):
+        if not self._authorize_secure_remote_control_plane():
+            return
+        parsed = urlparse(self.path)
+        expected_home_identity = parse_qs(parsed.query).get("homeIdentity", [""])[0]
+        if not is_valid_home_config_identity(expected_home_identity):
+            log_home_config("identityMismatch", operation="load", reason="invalidExpectedIdentity")
+            self._json(400, {"error": "invalid_home_identity"})
+            return
+
+        log_home_config("loadStarted", homeHash=safe_fingerprint(expected_home_identity))
+        try:
+            document = read_home_configuration_document()
+        except HomeConfigurationPersistenceError as error:
+            log_home_config("persistenceFailure", operation="load", reason=error.reason)
+            self._json(500, {"error": "home_config_persistence_failure", "reason": error.reason})
+            return
+
+        if document is None:
+            log_home_config("loadCompleted", result="notFound", homeHash=safe_fingerprint(expected_home_identity))
+            self._json(404, {"error": "not_found"})
+            return
+        if document.get("homeIdentity") != expected_home_identity:
+            log_home_config(
+                "identityMismatch",
+                operation="load",
+                expectedHash=safe_fingerprint(expected_home_identity),
+                actualHash=safe_fingerprint(str(document.get("homeIdentity") or ""))
+            )
+            self._json(403, {"error": "home_identity_mismatch"})
+            return
+
+        log_home_config(
+            "loadCompleted",
+            result="success",
+            homeHash=safe_fingerprint(expected_home_identity),
+            revision=document.get("revision", "unknown"),
+            domainRevisions=home_config_domain_revision_summary(document)
+        )
+        self._json(200, document)
+
+    def _handle_home_configuration_create(self):
+        if not self._authorize_secure_remote_control_plane():
+            return
+        try:
+            request = self._read_json_body(MAX_HOME_CONFIGURATION_BYTES)
+        except ValueError as error:
+            self._json(400, {"error": str(error)})
+            return
+        home_identity = str(request.get("homeIdentity") or "").strip() if isinstance(request, dict) else ""
+        if not is_valid_home_config_identity(home_identity):
+            log_home_config("identityMismatch", operation="create", reason="invalidHomeIdentity")
+            self._json(400, {"error": "invalid_home_identity"})
+            return
+
+        log_home_config("createStarted", homeHash=safe_fingerprint(home_identity))
+        try:
+            document, created = create_home_configuration_if_absent(home_identity)
+        except HomeConfigurationIdentityMismatchError as error:
+            log_home_config(
+                "identityMismatch",
+                operation="create",
+                expectedHash=safe_fingerprint(error.expected),
+                actualHash=safe_fingerprint(error.actual)
+            )
+            self._json(403, {"error": "home_identity_mismatch"})
+            return
+        except HomeConfigurationPersistenceError as error:
+            log_home_config("persistenceFailure", operation="create", reason=error.reason)
+            self._json(500, {"error": "home_config_persistence_failure", "reason": error.reason})
+            return
+
+        log_home_config(
+            "createCompleted",
+            result="created" if created else "alreadyExists",
+            homeHash=safe_fingerprint(home_identity),
+            revision=document.get("revision", "unknown")
+        )
+        self._json(201 if created else 200, document)
+
+    def _handle_home_configuration_mutation(self):
+        if not self._authorize_secure_remote_control_plane():
+            return
+        try:
+            request = self._read_json_body(MAX_HOME_CONFIGURATION_BYTES)
+        except ValueError as error:
+            self._json(400, {"error": str(error)})
+            return
+        if not isinstance(request, dict):
+            self._json(400, {"error": "body_not_json_object"})
+            return
+
+        home_identity = str(request.get("homeIdentity") or "").strip()
+        domain = str(request.get("domain") or "").strip()
+        base_domain_revision = request.get("baseDomainRevision")
+        updated_by_device = request.get("updatedByDeviceIDHash")
+        patch = request.get("patch")
+        if not is_valid_home_config_identity(home_identity):
+            log_home_config("identityMismatch", operation="mutation", reason="invalidHomeIdentity")
+            self._json(400, {"error": "invalid_home_identity"})
+            return
+        if domain not in HOME_CONFIG_DOMAINS:
+            self._json(400, {"error": "invalid_domain"})
+            return
+        if not isinstance(base_domain_revision, int) or base_domain_revision < 0:
+            self._json(400, {"error": "invalid_base_domain_revision"})
+            return
+        if updated_by_device is not None and not isinstance(updated_by_device, str):
+            self._json(400, {"error": "invalid_updated_by_device"})
+            return
+
+        log_home_config(
+            "mutationStarted",
+            homeHash=safe_fingerprint(home_identity),
+            domain=domain,
+            baseDomainRevision=base_domain_revision
+        )
+        try:
+            document = mutate_home_configuration(
+                home_identity=home_identity,
+                domain=domain,
+                base_domain_revision=base_domain_revision,
+                patch=patch,
+                updated_by_device_hash=updated_by_device
+            )
+        except HomeConfigurationIdentityMismatchError as error:
+            log_home_config(
+                "identityMismatch",
+                operation="mutation",
+                expectedHash=safe_fingerprint(error.expected),
+                actualHash=safe_fingerprint(error.actual)
+            )
+            self._json(403, {"error": "home_identity_mismatch"})
+            return
+        except HomeConfigurationConflictError as error:
+            log_home_config(
+                "conflict",
+                homeHash=safe_fingerprint(home_identity),
+                domain=domain,
+                attemptedBaseDomainRevision=error.attempted,
+                currentDomainRevision=error.current_domain_revision,
+                currentRevision=error.current_revision
+            )
+            self._json(409, {
+                "error": "revision_conflict",
+                "domain": domain,
+                "currentRevision": error.current_revision,
+                "currentDomainRevision": error.current_domain_revision,
+                "attemptedBaseDomainRevision": error.attempted
+            })
+            return
+        except HomeConfigurationValidationError as error:
+            self._json(400, {"error": error.reason})
+            return
+        except HomeConfigurationPersistenceError as error:
+            log_home_config("persistenceFailure", operation="mutation", reason=error.reason)
+            self._json(500, {"error": "home_config_persistence_failure", "reason": error.reason})
+            return
+
+        log_home_config(
+            "mutationCommitted",
+            homeHash=safe_fingerprint(home_identity),
+            domain=domain,
+            revision=document.get("revision", "unknown"),
+            domainRevision=document.get("domainRevisions", {}).get(domain, "unknown")
+        )
+        self._json(200, document)
 
     def _handle_secure_remote_provision(self):
         if not self._authorize_secure_remote_control_plane():
@@ -3772,6 +3969,291 @@ def envelope_canonical_payload(envelope):
     return {key: value for key, value in envelope.items() if key != "backend_signature"}
 
 
+HOME_CONFIG_SCHEMA_VERSION = 1
+HOME_CONFIG_DOMAINS = {
+    "dashboards",
+    "flowMetadata",
+    "energy",
+    "presentation",
+    "remoteAccessPolicy",
+    "homeSetup",
+    "extensions"
+}
+HOME_CONFIG_SECURITY_KEY_FRAGMENTS = (
+    "secret",
+    "token",
+    "private_key",
+    "privatekey",
+    "app_attest",
+    "attestation",
+    "refresh_token",
+    "access_token",
+    "pairing_record",
+    "secure_remote_route"
+)
+
+
+class HomeConfigurationPersistenceError(Exception):
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+class HomeConfigurationIdentityMismatchError(Exception):
+    def __init__(self, expected, actual):
+        super().__init__("home_identity_mismatch")
+        self.expected = expected
+        self.actual = actual
+
+
+class HomeConfigurationConflictError(Exception):
+    def __init__(self, current_revision, current_domain_revision, attempted):
+        super().__init__("revision_conflict")
+        self.current_revision = current_revision
+        self.current_domain_revision = current_domain_revision
+        self.attempted = attempted
+
+
+class HomeConfigurationValidationError(Exception):
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def log_home_config(stage, **fields):
+    rendered = " ".join(f"{key}={value}" for key, value in fields.items())
+    suffix = f" {rendered}" if rendered else ""
+    print(f"[SOSYNC-HOME-CONFIG] {stage}{suffix}", flush=True)
+
+
+def is_valid_home_config_identity(value):
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    if len(stripped) < 3 or len(stripped) > 512:
+        return False
+    return not any(ord(character) < 32 for character in stripped)
+
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def default_home_configuration(home_identity):
+    now = utc_now_iso()
+    return {
+        "schemaVersion": HOME_CONFIG_SCHEMA_VERSION,
+        "homeIdentity": home_identity,
+        "revision": 0,
+        "domainRevisions": {domain: 0 for domain in sorted(HOME_CONFIG_DOMAINS)},
+        "updatedAt": now,
+        "updatedByDeviceIDHash": None,
+        "homeSetup": "notStarted",
+        "dashboards": [],
+        "dashboardOrder": [],
+        "dashboardWidgets": [],
+        "flowMetadata": {},
+        "energy": {},
+        "presentation": {},
+        "remoteAccessPolicy": {
+            "enabled": True,
+            "updatedAt": None
+        },
+        "extensions": {}
+    }
+
+
+def home_config_domain_revision_summary(document):
+    revisions = document.get("domainRevisions", {}) if isinstance(document, dict) else {}
+    return ",".join(f"{domain}:{revisions.get(domain, 'missing')}" for domain in sorted(HOME_CONFIG_DOMAINS))
+
+
+def validate_json_compatible(value, path="root"):
+    if value is None or isinstance(value, bool) or isinstance(value, str):
+        return
+    if isinstance(value, int):
+        return
+    if isinstance(value, float):
+        if not value == value or value in (float("inf"), float("-inf")):
+            raise HomeConfigurationValidationError("invalid_json_value")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            validate_json_compatible(item, f"{path}.{index}")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise HomeConfigurationValidationError("invalid_json_key")
+            normalized = key.lower()
+            if any(fragment in normalized for fragment in HOME_CONFIG_SECURITY_KEY_FRAGMENTS):
+                raise HomeConfigurationValidationError("prohibited_security_field")
+            validate_json_compatible(item, f"{path}.{key}")
+        return
+    raise HomeConfigurationValidationError("invalid_json_value")
+
+
+def validate_home_configuration_document(document):
+    if not isinstance(document, dict):
+        raise HomeConfigurationPersistenceError("documentNotObject")
+    if document.get("schemaVersion") != HOME_CONFIG_SCHEMA_VERSION:
+        raise HomeConfigurationPersistenceError("unsupportedSchemaVersion")
+    if not is_valid_home_config_identity(document.get("homeIdentity")):
+        raise HomeConfigurationPersistenceError("invalidHomeIdentity")
+    if not isinstance(document.get("revision"), int) or document.get("revision") < 0:
+        raise HomeConfigurationPersistenceError("invalidRevision")
+    domain_revisions = document.get("domainRevisions")
+    if not isinstance(domain_revisions, dict):
+        raise HomeConfigurationPersistenceError("invalidDomainRevisions")
+    for domain in HOME_CONFIG_DOMAINS:
+        value = domain_revisions.get(domain)
+        if not isinstance(value, int) or value < 0:
+            raise HomeConfigurationPersistenceError("invalidDomainRevision")
+    validate_json_compatible(document)
+    return document
+
+
+def read_home_configuration_document():
+    started_at = time.monotonic()
+    try:
+        with open(HOME_CONFIGURATION_FILE, "r", encoding="utf-8") as file:
+            document = json.load(file)
+        validate_home_configuration_document(document)
+        log_home_config(
+            "loadCompleted",
+            source="disk",
+            revision=document.get("revision", "unknown"),
+            elapsedMs=elapsed_ms_since(started_at)
+        )
+        return document
+    except FileNotFoundError:
+        log_home_config("loadCompleted", source="disk", result="absent", elapsedMs=elapsed_ms_since(started_at))
+        return None
+    except json.JSONDecodeError as error:
+        raise HomeConfigurationPersistenceError(f"corruptJSON:{type(error).__name__}")
+
+
+def write_home_configuration_document(document):
+    validate_home_configuration_document(document)
+    os.makedirs(os.path.dirname(HOME_CONFIGURATION_FILE), exist_ok=True)
+    temporary_file = f"{HOME_CONFIGURATION_FILE}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+    started_at = time.monotonic()
+    with timed_lock(HOME_CONFIGURATION_WRITE_LOCK, "homeConfigWrite", log_threshold_ms=5):
+        try:
+            with open(temporary_file, "w", encoding="utf-8") as file:
+                json.dump(document, file, separators=(",", ":"))
+                file.flush()
+                os.fsync(file.fileno())
+            os.chmod(temporary_file, 0o600)
+            os.replace(temporary_file, HOME_CONFIGURATION_FILE)
+            os.chmod(HOME_CONFIGURATION_FILE, 0o600)
+            try:
+                directory_fd = os.open(os.path.dirname(HOME_CONFIGURATION_FILE), os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                pass
+        except OSError as error:
+            raise HomeConfigurationPersistenceError(type(error).__name__)
+        finally:
+            try:
+                if os.path.exists(temporary_file):
+                    os.remove(temporary_file)
+            except OSError:
+                pass
+    log_home_config(
+        "persistenceReadback",
+        event="writeCompleted",
+        revision=document.get("revision", "unknown"),
+        elapsedMs=elapsed_ms_since(started_at)
+    )
+    readback = read_home_configuration_document()
+    if readback != document:
+        raise HomeConfigurationPersistenceError("readbackMismatch")
+    log_home_config(
+        "persistenceReadback",
+        event="verified",
+        revision=document.get("revision", "unknown"),
+        domainRevisions=home_config_domain_revision_summary(document)
+    )
+
+
+def create_home_configuration_if_absent(home_identity):
+    existing = read_home_configuration_document()
+    if existing is not None:
+        existing_home_identity = existing.get("homeIdentity")
+        if existing_home_identity != home_identity:
+            raise HomeConfigurationIdentityMismatchError(home_identity, str(existing_home_identity or ""))
+        return copy_json_value(existing), False
+    document = default_home_configuration(home_identity)
+    write_home_configuration_document(document)
+    return copy_json_value(document), True
+
+
+def apply_home_configuration_patch(document, domain, patch):
+    validate_json_compatible(patch)
+    if domain == "dashboards":
+        if not isinstance(patch, dict):
+            raise HomeConfigurationValidationError("invalid_dashboard_patch")
+        dashboards = patch.get("dashboards", document.get("dashboards", []))
+        dashboard_order = patch.get("dashboardOrder", document.get("dashboardOrder", []))
+        dashboard_widgets = patch.get("dashboardWidgets", document.get("dashboardWidgets", []))
+        if not isinstance(dashboards, list) or not isinstance(dashboard_order, list) or not isinstance(dashboard_widgets, list):
+            raise HomeConfigurationValidationError("invalid_dashboard_patch")
+        document["dashboards"] = dashboards
+        document["dashboardOrder"] = dashboard_order
+        document["dashboardWidgets"] = dashboard_widgets
+    elif domain == "homeSetup":
+        state = patch.get("state") if isinstance(patch, dict) else patch
+        if state not in ("notStarted", "structureConfigured", "dashboardsConfigured", "complete"):
+            raise HomeConfigurationValidationError("invalid_home_setup_state")
+        document["homeSetup"] = state
+    elif domain == "remoteAccessPolicy":
+        if not isinstance(patch, dict) or not isinstance(patch.get("enabled"), bool):
+            raise HomeConfigurationValidationError("invalid_remote_access_policy")
+        document["remoteAccessPolicy"] = {
+            "enabled": patch["enabled"],
+            "updatedAt": patch.get("updatedAt") if isinstance(patch.get("updatedAt"), str) else utc_now_iso()
+        }
+    elif domain in ("flowMetadata", "energy", "presentation"):
+        if not isinstance(patch, dict):
+            raise HomeConfigurationValidationError(f"invalid_{domain}_patch")
+        document[domain] = patch
+    elif domain == "extensions":
+        if not isinstance(patch, dict):
+            raise HomeConfigurationValidationError("invalid_extensions_patch")
+        document["extensions"] = patch
+    else:
+        raise HomeConfigurationValidationError("invalid_domain")
+
+
+def mutate_home_configuration(home_identity, domain, base_domain_revision, patch, updated_by_device_hash=None):
+    with timed_lock(HOME_CONFIGURATION_WRITE_LOCK, "homeConfigMutation", log_threshold_ms=5):
+        document = read_home_configuration_document()
+        if document is None:
+            raise HomeConfigurationPersistenceError("notFound")
+        existing_home_identity = document.get("homeIdentity")
+        if existing_home_identity != home_identity:
+            raise HomeConfigurationIdentityMismatchError(home_identity, str(existing_home_identity or ""))
+        current_domain_revision = document.get("domainRevisions", {}).get(domain)
+        if current_domain_revision != base_domain_revision:
+            raise HomeConfigurationConflictError(
+                current_revision=document.get("revision", 0),
+                current_domain_revision=current_domain_revision,
+                attempted=base_domain_revision
+            )
+        next_document = copy_json_value(document)
+        apply_home_configuration_patch(next_document, domain, patch)
+        next_document["revision"] = int(document.get("revision", 0)) + 1
+        next_document["domainRevisions"][domain] = int(current_domain_revision) + 1
+        next_document["updatedAt"] = utc_now_iso()
+        next_document["updatedByDeviceIDHash"] = updated_by_device_hash
+        write_home_configuration_document(next_document)
+        return copy_json_value(next_document)
+
+
 def read_json_file(path, default, cache_ttl_seconds=0):
     now = time.monotonic()
     if cache_ttl_seconds > 0:
@@ -4680,6 +5162,7 @@ def main():
         flush=True
     )
     print("[SOSYNC-E2EE-COMPANION] routesRegistered identity=true pairingAuthorization=true pair=true revoke=true protocol=1", flush=True)
+    print("[SOSYNC-HOME-CONFIG] routesRegistered get=true create=true mutate=true path=/sosync/home-config mutationPath=/sosync/home-config/mutate protocol=1", flush=True)
     print("[SOSYNC-SECURE-REMOTE-COMPANION] routesRegistered identity=true status=true provision=true tunnelInstall=true tunnelRotate=true revoke=true dataPlane=true", flush=True)
     try:
         server.serve_forever()
