@@ -1040,7 +1040,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": str(error)})
             return
         binding = read_secure_remote_binding()
+        print(
+            f"[SOSYNC-SECURE-REMOTE-REVOCATION] stage=companionRevokeReceived routeIDHash={safe_fingerprint(data.get('route_id') or binding.get('route_id'))}",
+            flush=True
+        )
         if binding.get("route_id") and data.get("route_id") not in (None, binding.get("route_id")):
+            print(
+                f"[SOSYNC-SECURE-REMOTE-REVOCATION] stage=companionRevokeRejected reason=routeMismatch routeIDHash={safe_fingerprint(data.get('route_id'))} currentRouteIDHash={safe_fingerprint(binding.get('route_id'))}",
+                flush=True
+            )
             self._json(403, {"error": "route_mismatch"})
             return
         binding["status"] = "revoked"
@@ -1048,6 +1056,10 @@ class Handler(BaseHTTPRequestHandler):
         binding["tunnel_state"] = "revoked"
         write_json_file_secure(SECURE_REMOTE_BINDING_FILE, binding)
         stop_secure_remote_tunnel()
+        print(
+            f"[SOSYNC-SECURE-REMOTE-REVOCATION] stage=companionBindingRevoked routeIDHash={safe_fingerprint(binding.get('route_id'))} tunnelState=revoked failClosed=true",
+            flush=True
+        )
         print(
             f"[SOSYNC-SECURE-REMOTE-COMPANION] revoked route={safe_fingerprint(binding.get('route_id'))}",
             flush=True
@@ -1063,6 +1075,10 @@ class Handler(BaseHTTPRequestHandler):
             companion_dataplane_checkpoint("bindingReadComplete", request_id, timing_started_at)
             companion_dataplane_checkpoint("authOriginValidationStart", request_id, timing_started_at)
         if not binding.get("route_id") or binding.get("status") == "revoked":
+            print(
+                f"[SOSYNC-SECURE-REMOTE-REVOCATION] stage=companionDataPlaneRejected reason={'deviceRevoked' if binding.get('status') == 'revoked' else 'notBound'} routeIDHash={safe_fingerprint(binding.get('route_id'))} httpStatus=403 failClosed=true",
+                flush=True
+            )
             print(
                 "[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionOriginValidation routeValidationPassed=false originTokenValidationPassed=false reason=notBound",
                 flush=True
@@ -1233,6 +1249,10 @@ class Handler(BaseHTTPRequestHandler):
         )
         binding = read_secure_remote_binding()
         if not binding.get("route_id") or binding.get("status") == "revoked":
+            print(
+                f"[SOSYNC-SECURE-REMOTE-REVOCATION] stage=companionHealthRejected reason={'deviceRevoked' if binding.get('status') == 'revoked' else 'notBound'} routeIDHash={safe_fingerprint(binding.get('route_id'))} httpStatus=403 failClosed=true",
+                flush=True
+            )
             self._json(403, {
                 "protocol_version": 1,
                 "status": "unbound",

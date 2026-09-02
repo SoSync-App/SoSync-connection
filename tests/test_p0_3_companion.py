@@ -338,7 +338,7 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.44"', config)
+        self.assertIn('version: "1.0.45"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
@@ -1650,6 +1650,41 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertEqual(install_status, 200)
         self.assertEqual(install["tunnel_state"], "active")
         self.assertEqual(captured["args"][0][-2:], ["--token", "secret-tunnel-credential"])
+
+    def test_secure_remote_revoke_fails_closed_for_companion_dataplane(self):
+        route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
+        tunnel_id = "tun_abcdefghijklmnopqrstuvwxyz123456"
+        self._patch_cloudflared_start(running=True)
+        try:
+            with self._server() as base_url:
+                provision_status, _ = self._request_json(
+                    "POST",
+                    base_url,
+                    "/secure-remote/provision",
+                    self._valid_secure_remote_binding_request(route_id=route_id, tunnel_binding_id=tunnel_id)
+                )
+                install_status, _ = self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
+                    "protocol_version": 1,
+                    "route_id": route_id,
+                    "credential_version": 1,
+                    "tunnel_credential": "secret-tunnel-credential"
+                })
+                revoke_status, revoked = self._request_json("POST", base_url, "/secure-remote/revoke", {
+                    "protocol_version": 1,
+                    "route_id": route_id
+                })
+                health_status, health, _ = self._request_json_response("GET", base_url, "/secure-remote/data-plane/health/")
+        finally:
+            self._restore_cloudflared_start()
+
+        self.assertEqual(provision_status, 200)
+        self.assertEqual(install_status, 200)
+        self.assertEqual(revoke_status, 200)
+        self.assertEqual(revoked["status"], "revoked")
+        self.assertEqual(revoked["tunnel_state"], "notConfigured")
+        self.assertFalse(revoked["tunnel_configured"])
+        self.assertEqual(health_status, 403)
+        self.assertEqual(health["status"], "unbound")
 
     def test_secure_remote_rejects_semantic_route_and_stale_rotation(self):
         route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
