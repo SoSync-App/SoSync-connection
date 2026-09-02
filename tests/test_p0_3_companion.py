@@ -338,7 +338,7 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.43"', config)
+        self.assertIn('version: "1.0.44"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
@@ -1583,7 +1583,7 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertEqual(status["connector_tunnel_identity_failure"], "processNotRunning")
         self.assertEqual(status["connector_tunnel_token_format"], "unknown")
 
-    def test_secure_remote_process_alive_without_connector_registration_is_not_ready(self):
+    def test_secure_remote_tunnel_install_starting_then_healthy_is_nonterminal(self):
         route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
         tunnel_id = "tun_abcdefghijklmnopqrstuvwxyz123456"
         self._patch_cloudflared_start(running=True, stderr_message="INF cloudflared started but waiting for edge")
@@ -1602,10 +1602,15 @@ class CompanionP03Tests(unittest.TestCase):
                     "tunnel_credential": "secret-tunnel-credential"
                 })
                 health_status, health, _ = self._request_json_response("GET", base_url, "/secure-remote/data-plane/health/")
+                with open(app.secure_remote_tunnel_stderr_file(), "ab") as stderr:
+                    stderr.write(b"\nINF Registered tunnel connection connIndex=0")
+                app.SECURE_REMOTE_CONNECTOR_STATUS_CACHE = None
+                app.SECURE_REMOTE_CONNECTOR_STATUS_CACHE_EXPIRES_AT = 0
+                status_after_healthy_code, status_after_healthy = self._request_json("GET", base_url, "/secure-remote/status")
         finally:
             self._restore_cloudflared_start()
 
-        self.assertEqual(install_status, 503)
+        self.assertEqual(install_status, 200)
         self.assertFalse(install["tunnel_configured"])
         self.assertEqual(install["tunnel_state"], "connectorStarting")
         self.assertTrue(install["cloudflared_process_alive"])
@@ -1615,6 +1620,10 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertEqual(health["status"], "unavailable")
         self.assertTrue(health["cloudflared_process_alive"])
         self.assertFalse(health["connector_healthy"])
+        self.assertEqual(status_after_healthy_code, 200)
+        self.assertTrue(status_after_healthy["tunnel_configured"])
+        self.assertEqual(status_after_healthy["tunnel_state"], "active")
+        self.assertTrue(status_after_healthy["connector_healthy"])
 
     def test_secure_remote_tunnel_install_uses_worker_connector_token_mode(self):
         route_id = "r_abcdefghijklmnopqrstuvwxyz123456"

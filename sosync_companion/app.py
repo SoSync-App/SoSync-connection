@@ -958,8 +958,9 @@ class Handler(BaseHTTPRequestHandler):
             )
             start_result = start_secure_remote_tunnel(binding)
             connector_healthy = bool(start_result.get("connector_healthy"))
+            process_running = bool(start_result.get("running"))
             binding["tunnel_configured"] = connector_healthy
-            binding["tunnel_state"] = "active" if connector_healthy else ("connectorStarting" if start_result["running"] else "failed")
+            binding["tunnel_state"] = "active" if connector_healthy else ("connectorStarting" if process_running else "failed")
             binding["failure_stage"] = start_result.get("stage") if not connector_healthy else None
             binding["failure_reason"] = start_result.get("reason") if not connector_healthy else None
             if connector_healthy:
@@ -975,7 +976,15 @@ class Handler(BaseHTTPRequestHandler):
             f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelInstall route={safe_fingerprint(binding.get('route_id'))} credentialVersion={credential_version} credentialPresent={credential_present}",
             flush=True
         )
-        self._json(200 if binding["tunnel_configured"] else 503, secure_remote_public_status(binding))
+        public_status = secure_remote_public_status(binding)
+        process_running = bool(public_status.get("cloudflared_running") or public_status.get("cloudflared_process_alive"))
+        connector_starting = process_running and public_status.get("tunnel_state") == "connectorStarting"
+        http_status = 200 if binding["tunnel_configured"] or connector_starting else 503
+        print(
+            f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelInstallResponse route={safe_fingerprint(binding.get('route_id'))} httpStatus={http_status} processRunning={process_running} connectorState={public_status.get('connector_state') or 'unknown'} connectorHealthy={public_status.get('connector_healthy')} bindingGeneration={credential_version}",
+            flush=True
+        )
+        self._json(http_status, public_status)
 
     def _handle_secure_remote_tunnel_rotate(self):
         if not self._authorize_secure_remote_control_plane():
