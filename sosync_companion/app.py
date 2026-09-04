@@ -106,6 +106,7 @@ COMPANION_ACTIVE_HTTP_REQUESTS = 0
 COMPANION_ACTIVE_WEBSOCKETS = 0
 COMPANION_REQUEST_SEQUENCE = 0
 COMPANION_E2EE_SESSION_CORRELATION = {}
+COMPANION_RUNTIME_HEARTBEAT_STOP = threading.Event()
 COMPANION_IDENTITY_CACHE = None
 E2EE_IDENTITY_CACHE = None
 E2EE_PUBLIC_KEY_NORMALIZATION_CACHE = {}
@@ -270,6 +271,49 @@ def companion_request_started(method, path):
     return request_id
 
 
+def companion_client_scope(client_address):
+    host = "unknown"
+    if isinstance(client_address, tuple) and client_address:
+        host = str(client_address[0] or "unknown")
+    if host.startswith("127.") or host == "::1":
+        return "loopback"
+    if host.startswith("10.") or host.startswith("192.168."):
+        return "privateLAN"
+    if host.startswith("172."):
+        parts = host.split(".")
+        if len(parts) > 1 and parts[1].isdigit() and 16 <= int(parts[1]) <= 31:
+            return "privateLAN"
+    if host.startswith("169.254.") or host.lower().startswith("fe80:"):
+        return "linkLocal"
+    if ":" in host:
+        return "ipv6"
+    return "publicOrUnknown"
+
+
+def companion_listener_address_summary(server):
+    try:
+        bind_host, bind_port = server.server_address[:2]
+    except (AttributeError, TypeError, ValueError):
+        return "bindAddress=unknown port=unknown"
+    parts = [
+        f"bindAddress={bind_host}",
+        f"port={bind_port}",
+        f"family={getattr(server, 'address_family', 'unknown')}",
+        f"socketName={safe_listener_socket_name(server)}",
+    ]
+    return " ".join(parts)
+
+
+def safe_listener_socket_name(server):
+    try:
+        socket_name = server.socket.getsockname()
+    except OSError:
+        return "unavailable"
+    if not isinstance(socket_name, tuple) or len(socket_name) < 2:
+        return "unknown"
+    return f"{socket_name[0]}:{socket_name[1]}"
+
+
 def companion_request_completed(request_id, method, path, started_at):
     global COMPANION_ACTIVE_HTTP_REQUESTS
     elapsed_ms = int((time.monotonic() - started_at) * 1000)
@@ -339,6 +383,35 @@ def companion_perf_log(event, **fields):
     for key, value in fields.items():
         parts.append(f"{key}={value}")
     print(" ".join(parts), flush=True)
+
+
+def companion_identity_server_perf(phase, request_id, started_at, **fields):
+    parts = [
+        "[SOSYNC-COMPANION-IDENTITY-SERVER-PERF]",
+        f"phase={phase}",
+        f"requestID={request_id}",
+        f"elapsedMs={elapsed_ms_since(started_at)}",
+        f"runtimeInstance={RUNTIME_INSTANCE_ID}",
+        f"thread={threading.get_ident()}",
+    ]
+    for key, value in fields.items():
+        parts.append(f"{key}={value}")
+    print(" ".join(parts), flush=True)
+
+
+def start_companion_runtime_heartbeat(interval_seconds=0.5, stall_threshold_ms=1500):
+    def heartbeat():
+        previous = time.monotonic()
+        while not COMPANION_RUNTIME_HEARTBEAT_STOP.wait(interval_seconds):
+            now = time.monotonic()
+            gap_ms = int((now - previous) * 1000)
+            previous = now
+            if gap_ms >= stall_threshold_ms:
+                companion_perf_log("runtimeStallDetected", gapMs=gap_ms)
+
+    thread = threading.Thread(target=heartbeat, daemon=True)
+    thread.start()
+    return thread
 
 
 def companion_perf_log_if_slow(event, elapsed_ms, threshold_ms=25, **fields):
@@ -495,11 +568,32 @@ def copy_json_value(value):
 
 
 class Handler(BaseHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        print(
+            "[SOSYNC-COMPANION-LISTENER] "
+            "state=connectionAccepted "
+            f"clientScope={companion_client_scope(getattr(self, 'client_address', None))} "
+            f"runtimeInstance={RUNTIME_INSTANCE_ID} "
+            f"thread={threading.get_ident()}",
+            flush=True
+        )
+
     def parse_request(self):
         parsed = super().parse_request()
         if parsed:
             self._sosync_request_started_at = time.monotonic()
             self._sosync_request_id = companion_request_started(self.command, self.path)
+            print(
+                "[SOSYNC-COMPANION-LISTENER] "
+                "state=requestArrived "
+                f"requestID={self._sosync_request_id} "
+                f"method={self.command} "
+                f"pathClass={companion_path_class(self.path)} "
+                f"clientScope={companion_client_scope(getattr(self, 'client_address', None))} "
+                f"runtimeInstance={RUNTIME_INSTANCE_ID}",
+                flush=True
+            )
         return parsed
 
     def handle_one_request(self):
@@ -637,18 +731,37 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/identity":
             identity_started_at = time.monotonic()
+            request_id = self._request_id_for_log()
+            companion_identity_server_perf(
+                "handlerEntered",
+                request_id,
+                identity_started_at,
+                activeHTTP=COMPANION_ACTIVE_HTTP_REQUESTS,
+                activeWebSockets=COMPANION_ACTIVE_WEBSOCKETS
+            )
+            companion_identity_server_perf("identityLookupStarted", request_id, identity_started_at)
             identity = ensure_companion_identity()
+            companion_identity_server_perf("identityLookupCompleted", request_id, identity_started_at)
+            companion_identity_server_perf("serverIdentityLookupStarted", request_id, identity_started_at)
             server_id = get_or_create_server_id()
+            companion_identity_server_perf("serverIdentityLookupCompleted", request_id, identity_started_at)
+            companion_identity_server_perf("remoteURLLookupStarted", request_id, identity_started_at)
             remote_url = read_remote_url()
+            companion_identity_server_perf("remoteURLLookupCompleted", request_id, identity_started_at)
+            companion_identity_server_perf("cloudflaredStatusStarted", request_id, identity_started_at)
             runtime = cloudflared_runtime_status()
+            companion_identity_server_perf("cloudflaredStatusCompleted", request_id, identity_started_at)
+            companion_identity_server_perf("secureRemoteStatusStarted", request_id, identity_started_at)
             secure_remote_status = secure_remote_public_status()
+            companion_identity_server_perf("secureRemoteStatusCompleted", request_id, identity_started_at)
             companion_perf_log(
                 "handlerCheckpoint",
-                requestID=self._request_id_for_log(),
+                requestID=request_id,
                 pathClass="identity",
                 stage="dependenciesLoaded",
                 elapsedMs=elapsed_ms_since(identity_started_at)
             )
+            companion_identity_server_perf("responseWriteStarted", request_id, identity_started_at)
             self._json(200, {
                 "protocol_version": 1,
                 "companion_version": SOSYNC_COMPANION_VERSION,
@@ -670,6 +783,7 @@ class Handler(BaseHTTPRequestHandler):
                 "tunnel_state": secure_remote_status["tunnel_state"],
                 "cloudflared_running": secure_remote_status["cloudflared_running"]
             })
+            companion_identity_server_perf("handlerExited", request_id, identity_started_at)
             return
 
         if self.path == "/security/e2ee/identity":
@@ -5118,6 +5232,7 @@ def is_local_client(address):
 
 
 def main():
+    COMPANION_RUNTIME_HEARTBEAT_STOP.clear()
     print(f"[SOSYNC-E2EE-COMPANION] runtimeStarted runtimeInstance={RUNTIME_INSTANCE_ID} build={SOSYNC_COMPANION_BUILD}", flush=True)
     log_e2ee_pairing_store_loaded()
     log_pairing_authorization_loaded()
@@ -5155,10 +5270,17 @@ def main():
             flush=True
         )
         raise
+    print(
+        "[SOSYNC-COMPANION-LISTENER] "
+        f"state=constructed {companion_listener_address_summary(server)} "
+        f"runtimeInstance={RUNTIME_INSTANCE_ID}",
+        flush=True
+    )
+    heartbeat_thread = start_companion_runtime_heartbeat()
     print(f"SoSync Companion listening on port {PORT}")
     print(f"[SOSYNC-E2EE-COMPANION] runtimeListening runtimeInstance={RUNTIME_INSTANCE_ID} port={PORT}", flush=True)
     print(
-        f"[SOSYNC-COMPANION-LISTENER] state=listening bindAddress={bind_address} port={PORT} runtimeInstance={RUNTIME_INSTANCE_ID} reason=serveForeverStarting",
+        f"[SOSYNC-COMPANION-LISTENER] state=listening {companion_listener_address_summary(server)} runtimeInstance={RUNTIME_INSTANCE_ID} reason=serveForeverStarting",
         flush=True
     )
     print("[SOSYNC-E2EE-COMPANION] routesRegistered identity=true pairingAuthorization=true pair=true revoke=true protocol=1", flush=True)
@@ -5173,11 +5295,13 @@ def main():
         )
         raise
     finally:
+        COMPANION_RUNTIME_HEARTBEAT_STOP.set()
         print(
             f"[SOSYNC-COMPANION-LISTENER] state=stopped bindAddress={bind_address} port={PORT} runtimeInstance={RUNTIME_INSTANCE_ID} reason=serveForeverExited",
             flush=True
         )
         server.server_close()
+        heartbeat_thread.join(timeout=1)
 
 
 if __name__ == "__main__":

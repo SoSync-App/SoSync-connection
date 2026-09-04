@@ -59,6 +59,38 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertNotIn("signing_private_key", first[1])
         self.assertNotIn("encryption_private_key", first[1])
 
+    def test_identity_request_emits_listener_and_handler_timing_boundaries(self):
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            with self._server() as base_url:
+                status, body = self._request_json("GET", base_url, "/identity")
+
+        self.assertEqual(status, 200)
+        self.assertIn("runtime_instance_id", body)
+        logs = captured.getvalue()
+        self.assertIn("[SOSYNC-COMPANION-LISTENER] state=connectionAccepted", logs)
+        self.assertIn("[SOSYNC-COMPANION-LISTENER] state=requestArrived", logs)
+        self.assertIn("pathClass=identity", logs)
+        self.assertIn("[SOSYNC-COMPANION-IDENTITY-SERVER-PERF] phase=handlerEntered", logs)
+        self.assertIn("[SOSYNC-COMPANION-IDENTITY-SERVER-PERF] phase=identityLookupStarted", logs)
+        self.assertIn("[SOSYNC-COMPANION-IDENTITY-SERVER-PERF] phase=identityLookupCompleted", logs)
+        self.assertIn("[SOSYNC-COMPANION-IDENTITY-SERVER-PERF] phase=secureRemoteStatusCompleted", logs)
+        self.assertIn("[SOSYNC-COMPANION-IDENTITY-SERVER-PERF] phase=handlerExited", logs)
+        self.assertNotIn("signing_private_key", logs)
+        self.assertNotIn("encryption_private_key", logs)
+
+    def test_listener_address_summary_proves_lan_bind_without_secret_payload(self):
+        server = ThreadingHTTPServer(("0.0.0.0", 0), app.Handler)
+        try:
+            summary = app.companion_listener_address_summary(server)
+        finally:
+            server.server_close()
+
+        self.assertIn("bindAddress=0.0.0.0", summary)
+        self.assertIn("port=", summary)
+        self.assertNotIn("private_key", summary)
+        self.assertNotIn("token", summary)
+
     def test_e2ee_identity_route_is_exposed_by_addon_runtime(self):
         with self._server() as base_url:
             status, body = self._request_json("GET", base_url, "/security/e2ee/identity")
@@ -338,7 +370,7 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.46"', config)
+        self.assertIn('version: "1.0.47"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
