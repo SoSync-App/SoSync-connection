@@ -74,10 +74,33 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("[SOSYNC-COMPANION-IDENTITY-SERVER-PERF] phase=handlerEntered", logs)
         self.assertIn("[SOSYNC-COMPANION-IDENTITY-SERVER-PERF] phase=identityLookupStarted", logs)
         self.assertIn("[SOSYNC-COMPANION-IDENTITY-SERVER-PERF] phase=identityLookupCompleted", logs)
-        self.assertIn("[SOSYNC-COMPANION-IDENTITY-SERVER-PERF] phase=secureRemoteStatusCompleted", logs)
+        self.assertIn("[SOSYNC-COMPANION-IDENTITY-SERVER-PERF] phase=secureRemoteStatusSnapshotCompleted", logs)
         self.assertIn("[SOSYNC-COMPANION-IDENTITY-SERVER-PERF] phase=handlerExited", logs)
         self.assertNotIn("signing_private_key", logs)
         self.assertNotIn("encryption_private_key", logs)
+
+    def test_identity_route_does_not_block_on_authoritative_secure_remote_status_pipeline(self):
+        original_secure_remote_public_status = app.secure_remote_public_status
+        calls = []
+
+        def blocking_status(*args, **kwargs):
+            calls.append("called")
+            time.sleep(1.0)
+            return original_secure_remote_public_status(*args, **kwargs)
+
+        app.secure_remote_public_status = blocking_status
+        try:
+            started_at = time.monotonic()
+            with self._server() as base_url:
+                status, body = self._request_json("GET", base_url, "/identity")
+            elapsed = time.monotonic() - started_at
+        finally:
+            app.secure_remote_public_status = original_secure_remote_public_status
+
+        self.assertEqual(status, 200)
+        self.assertIn("tunnel_state", body)
+        self.assertEqual(calls, [])
+        self.assertLess(elapsed, 1.0)
 
     def test_listener_address_summary_proves_lan_bind_without_secret_payload(self):
         server = ThreadingHTTPServer(("0.0.0.0", 0), app.Handler)
@@ -370,7 +393,7 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.47"', config)
+        self.assertIn('version: "1.0.48"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)

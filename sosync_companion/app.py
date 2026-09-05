@@ -751,9 +751,14 @@ class Handler(BaseHTTPRequestHandler):
             companion_identity_server_perf("cloudflaredStatusStarted", request_id, identity_started_at)
             runtime = cloudflared_runtime_status()
             companion_identity_server_perf("cloudflaredStatusCompleted", request_id, identity_started_at)
-            companion_identity_server_perf("secureRemoteStatusStarted", request_id, identity_started_at)
-            secure_remote_status = secure_remote_public_status()
-            companion_identity_server_perf("secureRemoteStatusCompleted", request_id, identity_started_at)
+            companion_identity_server_perf("secureRemoteStatusSnapshotStarted", request_id, identity_started_at)
+            secure_remote_status = secure_remote_identity_snapshot_status()
+            companion_identity_server_perf(
+                "secureRemoteStatusSnapshotCompleted",
+                request_id,
+                identity_started_at,
+                snapshotSource=secure_remote_status.get("snapshot_source", "unknown")
+            )
             companion_perf_log(
                 "handlerCheckpoint",
                 requestID=request_id,
@@ -4639,6 +4644,47 @@ def secure_remote_public_status(binding=None):
         "connector_tunnel_token_format": connector_identity["connector_tunnel_token_format"],
         "updated_at": binding.get("updated_at"),
         "revoked_at": binding.get("revoked_at")
+    }
+
+
+def secure_remote_identity_snapshot_status(binding=None):
+    started_at = time.monotonic()
+    binding = binding if isinstance(binding, dict) else read_secure_remote_binding()
+    has_route = bool(binding.get("route_id")) and binding.get("status") != "revoked"
+    cloudflared_running = is_secure_remote_tunnel_running()
+    cached_connector = (
+        dict(SECURE_REMOTE_CONNECTOR_STATUS_CACHE)
+        if SECURE_REMOTE_CONNECTOR_STATUS_CACHE and SECURE_REMOTE_CONNECTOR_STATUS_CACHE_EXPIRES_AT > time.monotonic()
+        else None
+    )
+    if not has_route:
+        tunnel_state = "notConfigured"
+        snapshot_source = "bindingNoRoute"
+    elif cached_connector and cached_connector.get("connector_healthy"):
+        tunnel_state = "active"
+        snapshot_source = "cachedConnector"
+    elif cloudflared_running:
+        tunnel_state = binding.get("tunnel_state") or "connectorStarting"
+        snapshot_source = "processSnapshot"
+    elif binding.get("tunnel_state") == "failed":
+        tunnel_state = "failed"
+        snapshot_source = "bindingFailure"
+    elif binding.get("tunnel_configured"):
+        tunnel_state = binding.get("tunnel_state") or "credentialInstalled"
+        snapshot_source = "bindingSnapshot"
+    else:
+        tunnel_state = "notConfigured"
+        snapshot_source = "bindingSnapshot"
+    companion_perf_log(
+        "identitySecureRemoteStatusSnapshot",
+        elapsedMs=elapsed_ms_since(started_at),
+        snapshotSource=snapshot_source,
+        cloudflaredRunning=str(bool(cloudflared_running)).lower()
+    )
+    return {
+        "tunnel_state": tunnel_state,
+        "cloudflared_running": cloudflared_running,
+        "snapshot_source": snapshot_source
     }
 
 
