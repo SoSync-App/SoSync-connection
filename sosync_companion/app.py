@@ -1413,6 +1413,10 @@ class Handler(BaseHTTPRequestHandler):
         if timing_started_at is not None:
             companion_dataplane_checkpoint("authOriginValidationComplete", request_id, timing_started_at, routeOK=str(route_ok).lower(), tokenOK=str(token_ok).lower())
         if not route_ok or not token_ok:
+            print(
+                f"[SOSYNC-COMPANION-E2EE-REST] phase=originAuthRejected routeHash={safe_fingerprint(binding.get('route_id'))} tunnelBindingHash={safe_fingerprint(binding.get('tunnel_binding_id'))} routeValidationPassed={str(route_ok).lower()} originTokenValidationPassed={str(token_ok).lower()} companionBuild={SOSYNC_COMPANION_BUILD}",
+                flush=True
+            )
             self._json(401, {"error": "unauthorized"}, headers={
                 "X-SoSync-Origin": "companion",
                 "X-SoSync-Route": "auth"
@@ -1486,8 +1490,16 @@ class Handler(BaseHTTPRequestHandler):
             rest_target = str(request.get("target") or "ha").strip().lower()
             rest_path = str(request.get("path") or "/")
             method = str(request.get("method") or "GET").upper()
+            print(
+                f"[SOSYNC-COMPANION-E2EE-REST] phase=requestDecoded target={rest_target} method={method} pathClass={companion_rest_path_class_for_log(rest_path) if rest_target == 'companion' else ha_path_class_for_log(rest_path)} companionBuild={SOSYNC_COMPANION_BUILD}",
+                flush=True
+            )
             if rest_target == "ha":
                 if not is_allowed_ha_path(rest_path) and not (rest_path == "/auth/token" and method == "POST"):
+                    print(
+                        f"[SOSYNC-COMPANION-E2EE-REST] phase=routeRejected target=ha method={method} pathClass={ha_path_class_for_log(rest_path)} reason=haRouteNotAllowed companionBuild={SOSYNC_COMPANION_BUILD}",
+                        flush=True
+                    )
                     self._json(403, {"error": "route_not_allowed"})
                     return
                 response = perform_secure_remote_dataplane_rest(method, rest_path, request.get("headers") or {}, request.get("body_base64url"))
@@ -1495,14 +1507,22 @@ class Handler(BaseHTTPRequestHandler):
             elif rest_target == "companion":
                 if not is_allowed_secure_remote_companion_rest_path(rest_path):
                     print(
-                        f"[SOSYNC-SECURE-REMOTE-REST] phase=response target=companion method={method} pathClass={companion_rest_path_class_for_log(rest_path)} status=403 failureLayer=companionOrigin requestEncrypted=true",
+                        f"[SOSYNC-COMPANION-E2EE-REST] phase=routeRejected target=companion method={method} pathClass={companion_rest_path_class_for_log(rest_path)} reason=companionRouteNotAllowed companionBuild={SOSYNC_COMPANION_BUILD}",
                         flush=True
                     )
                     self._json(403, {"error": "companion_route_not_allowed"})
                     return
+                print(
+                    f"[SOSYNC-COMPANION-E2EE-REST] target=companion method={method} pathClass={companion_rest_path_class_for_log(rest_path)} result=accepted companionBuild={SOSYNC_COMPANION_BUILD}",
+                    flush=True
+                )
                 response = perform_secure_remote_companion_rest(method, rest_path, request.get("body_base64url"))
                 path_class = companion_rest_path_class_for_log(rest_path)
             else:
+                print(
+                    f"[SOSYNC-COMPANION-E2EE-REST] phase=routeRejected target={rest_target} method={method} pathClass=unknown reason=targetNotAllowed companionBuild={SOSYNC_COMPANION_BUILD}",
+                    flush=True
+                )
                 self._json(403, {"error": "target_not_allowed"})
                 return
             response_plain = json.dumps(response, separators=(",", ":")).encode("utf-8")

@@ -393,7 +393,7 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.48"', config)
+        self.assertIn('version: "1.0.50"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
@@ -413,6 +413,9 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("companionBuild marker=", runtime)
         self.assertIn('HOME_CONFIGURATION_PATH = "/sosync/home-config"', runtime)
         self.assertIn('HOME_CONFIGURATION_MUTATION_PATH = "/sosync/home-config/mutate"', runtime)
+        self.assertIn('rest_target == "companion"', runtime)
+        self.assertIn("perform_secure_remote_companion_rest", runtime)
+        self.assertIn("[SOSYNC-COMPANION-E2EE-REST]", runtime)
         self.assertIn("def _handle_home_configuration_get", runtime)
         self.assertIn("def _handle_home_configuration_create", runtime)
         self.assertIn("def _handle_home_configuration_mutation", runtime)
@@ -1279,6 +1282,8 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("[SOSYNC-SECURE-REMOTE-REST] phase=response target=companion method=POST pathClass=companionHomeConfig status=201 failureLayer=none requestEncrypted=true", logs)
         self.assertIn("[SOSYNC-SECURE-REMOTE-REST] phase=response target=companion method=GET pathClass=companionHomeConfig status=200 failureLayer=none requestEncrypted=true", logs)
         self.assertIn("[SOSYNC-SECURE-REMOTE-REST] phase=response target=companion method=POST pathClass=companionHomeConfigMutation status=200 failureLayer=none requestEncrypted=true", logs)
+        self.assertIn("[SOSYNC-COMPANION-E2EE-REST] phase=requestDecoded target=companion method=GET pathClass=companionHomeConfig", logs)
+        self.assertIn("[SOSYNC-COMPANION-E2EE-REST] target=companion method=GET pathClass=companionHomeConfig result=accepted", logs)
 
     def test_secure_remote_encrypted_rest_unknown_companion_path_fails_closed(self):
         binding, headers = self._seed_secure_remote_dataplane_session()
