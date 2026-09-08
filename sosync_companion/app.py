@@ -2556,6 +2556,7 @@ def create_secure_remote_dataplane_session(binding, request, request_id="unknown
         "companion_key": hkdf_dataplane_key(shared, context, b"|companion_to_client"),
         "session_generation": 1,
         "highest_client_sequence": 0,
+        "highest_client_sequence_by_transport": {},
         "next_companion_sequence": 1,
         "expires_at": time.time() + 60,
         "expires_in_seconds": 60
@@ -2605,13 +2606,29 @@ def hkdf_dataplane_key(shared_secret, context, direction_suffix):
     ).derive(shared_secret)
 
 
-def secure_remote_dataplane_aad(route_id, session_id, device_id, direction, sequence, message_id):
-    return f"v=1|route={route_id}|session={session_id}|device={device_id}|direction={direction}|sequence={sequence}|message={message_id}".encode("utf-8")
+def secure_remote_dataplane_aad(route_id, session_id, device_id, direction, sequence, message_id, transport="unknown"):
+    return f"v=1|route={route_id}|session={session_id}|device={device_id}|direction={direction}|transport={transport}|sequence={sequence}|message={message_id}".encode("utf-8")
+
+
+def secure_remote_replay_domain(direction, transport):
+    if direction == "inbound":
+        return f"client_to_companion:{transport}"
+    if direction == "outbound":
+        return f"companion_to_client:{transport}"
+    return f"{direction}:{transport}"
+
+
+def secure_remote_previous_client_sequence(session, transport):
+    sequences = session.get("highest_client_sequence_by_transport") if isinstance(session, dict) else None
+    if isinstance(sequences, dict):
+        return int(sequences.get(transport) or 0)
+    return 0
 
 
 def log_secure_remote_sequence(session, direction, transport, target, request_class, sequence, previous_accepted_sequence, validation_result):
     session_id = session.get("session_id") if isinstance(session, dict) else None
     session_generation = session.get("session_generation", "unknown") if isinstance(session, dict) else "unknown"
+    replay_domain = secure_remote_replay_domain(direction, transport)
     print(
         "[SOSYNC-SECURE-REMOTE-SEQUENCE] "
         f"sessionIDHash={safe_fingerprint(session_id)} "
@@ -2622,7 +2639,8 @@ def log_secure_remote_sequence(session, direction, transport, target, request_cl
         f"requestClass={request_class} "
         f"sequence={sequence} "
         f"previousAcceptedSequence={previous_accepted_sequence} "
-        f"validationResult={validation_result}",
+        f"validationResult={validation_result} "
+        f"replayDomain={replay_domain}",
         flush=True
     )
 
@@ -2630,7 +2648,7 @@ def log_secure_remote_sequence(session, direction, transport, target, request_cl
 def validate_client_sequence_before_decrypt(binding, session, sequence, transport, target, request_class):
     with timed_lock(SECURE_REMOTE_DATAPLANE_LOCK, "dataplaneClientSequenceValidate", log_threshold_ms=10):
         current = SECURE_REMOTE_DATAPLANE_SESSIONS.get((binding.get("route_id"), session["session_id"]))
-        previous = int((current or session).get("highest_client_sequence") or 0)
+        previous = secure_remote_previous_client_sequence(current or session, transport)
         accepted = current is not None and sequence > previous
     log_secure_remote_sequence(session, "inbound", transport, target, request_class, sequence, previous, "accepted" if accepted else "rejected")
     if not accepted:
@@ -2640,11 +2658,14 @@ def validate_client_sequence_before_decrypt(binding, session, sequence, transpor
 def record_client_sequence_after_decrypt(binding, session, sequence, transport, target, request_class):
     with timed_lock(SECURE_REMOTE_DATAPLANE_LOCK, "dataplaneClientSequenceUpdate", log_threshold_ms=10):
         current = SECURE_REMOTE_DATAPLANE_SESSIONS.get((binding.get("route_id"), session["session_id"]))
-        previous = int((current or session).get("highest_client_sequence") or 0)
+        previous = secure_remote_previous_client_sequence(current or session, transport)
         if current is None or sequence <= previous:
             log_secure_remote_sequence(session, "inbound", transport, target, request_class, sequence, previous, "rejected")
             raise ValueError("replayRejected")
-        current["highest_client_sequence"] = sequence
+        sequences = dict(current.get("highest_client_sequence_by_transport") or {})
+        sequences[transport] = sequence
+        current["highest_client_sequence_by_transport"] = sequences
+        current["highest_client_sequence"] = max(int(current.get("highest_client_sequence") or 0), sequence)
         SECURE_REMOTE_DATAPLANE_SESSIONS[(binding.get("route_id"), current["session_id"])] = current
 
 
@@ -2719,7 +2740,7 @@ def decrypt_secure_remote_dataplane_envelope(binding, envelope, expected_directi
         print("[SOSYNC-COMPANION-E2EE-REST] phase=ciphertextDecodeCompleted result=rejected exception=ValueError reason=missingCiphertext", flush=True)
         raise ValueError("missingCiphertext")
     print("[SOSYNC-COMPANION-E2EE-REST] phase=ciphertextDecodeCompleted result=accepted", flush=True)
-    aad = secure_remote_dataplane_aad(binding.get("route_id"), session["session_id"], session["device_id"], expected_direction, sequence, str(envelope.get("message_id") or ""))
+    aad = secure_remote_dataplane_aad(binding.get("route_id"), session["session_id"], session["device_id"], expected_direction, sequence, str(envelope.get("message_id") or ""), transport=transport)
     crypto_core_started_at = time.monotonic()
     print("[SOSYNC-COMPANION-E2EE-REST] phase=decryptStarted", flush=True)
     try:
@@ -2753,7 +2774,7 @@ def encrypt_secure_remote_dataplane_envelope(binding, session_id, plaintext, dir
     session, sequence = allocate_companion_sequence(binding, session_id, enforce_expiry, transport, target, request_class)
     session_lookup_ms = elapsed_ms_since(session_lookup_started_at)
     nonce = os.urandom(12)
-    aad = secure_remote_dataplane_aad(binding.get("route_id"), session["session_id"], session["device_id"], direction, sequence, message_id)
+    aad = secure_remote_dataplane_aad(binding.get("route_id"), session["session_id"], session["device_id"], direction, sequence, message_id, transport=transport)
     crypto_core_started_at = time.monotonic()
     ciphertext = ChaCha20Poly1305(session["companion_key"]).encrypt(nonce, plaintext, aad)
     crypto_core_ms = elapsed_ms_since(crypto_core_started_at)

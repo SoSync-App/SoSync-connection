@@ -393,7 +393,7 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.53"', config)
+        self.assertIn('version: "1.0.54"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
@@ -693,6 +693,7 @@ class CompanionP03Tests(unittest.TestCase):
             "device_id": "device-1",
             "expires_at": time.time() - 1,
             "highest_client_sequence": 0,
+            "highest_client_sequence_by_transport": {},
             "next_companion_sequence": 1
         }
         key = (binding["route_id"], expired_open_websocket_session["session_id"])
@@ -748,6 +749,114 @@ class CompanionP03Tests(unittest.TestCase):
         logs = captured.getvalue()
         self.assertIn("direction=outbound transport=rest target=companion requestClass=companionHomeConfig sequence=1", logs)
         self.assertIn("direction=outbound transport=webSocket target=ha requestClass=haWebSocket sequence=2", logs)
+        self.assertIn("replayDomain=companion_to_client:rest", logs)
+        self.assertIn("replayDomain=companion_to_client:webSocket", logs)
+
+    def test_secure_remote_inbound_replay_domain_accepts_rest_after_higher_websocket_sequence(self):
+        binding, _ = self._seed_secure_remote_dataplane_session()
+        websocket_payload = {"type": "event", "id": 10}
+        for sequence in range(10, 15):
+            envelope = self._client_to_companion_envelope(
+                binding,
+                websocket_payload,
+                sequence=sequence,
+                transport="webSocket",
+                message_id=f"test-ws-{sequence}"
+            )
+            plaintext = app.decrypt_secure_remote_dataplane_envelope(
+                binding,
+                envelope,
+                "client_to_companion",
+                enforce_expiry=False,
+                transport="webSocket",
+                target="ha",
+                request_class="haWebSocket"
+            )
+            self.assertEqual(json.loads(plaintext.decode("utf-8")), websocket_payload)
+
+        rest_envelope = self._client_to_companion_envelope(
+            binding,
+            {"target": "companion", "method": "GET", "path": "/sosync/home-config"},
+            sequence=9,
+            transport="rest",
+            message_id="test-rest-9"
+        )
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            plaintext = app.decrypt_secure_remote_dataplane_envelope(
+                binding,
+                rest_envelope,
+                "client_to_companion",
+                enforce_expiry=False,
+                transport="rest",
+                target="companion",
+                request_class="companionHomeConfig"
+            )
+
+        self.assertEqual(json.loads(plaintext.decode("utf-8"))["path"], "/sosync/home-config")
+        session = app.SECURE_REMOTE_DATAPLANE_SESSIONS[(binding["route_id"], "session-home-config")]
+        self.assertEqual(session["highest_client_sequence_by_transport"]["webSocket"], 14)
+        self.assertEqual(session["highest_client_sequence_by_transport"]["rest"], 9)
+        logs = captured.getvalue()
+        self.assertIn("previousAcceptedSequence=0 validationResult=accepted replayDomain=client_to_companion:rest", logs)
+
+    def test_secure_remote_inbound_rest_replay_is_rejected_within_rest_domain(self):
+        binding, _ = self._seed_secure_remote_dataplane_session()
+        payload = {"target": "companion", "method": "GET", "path": "/sosync/home-config"}
+        envelope = self._client_to_companion_envelope(binding, payload, sequence=9, transport="rest", message_id="test-rest-9")
+        app.decrypt_secure_remote_dataplane_envelope(binding, envelope, "client_to_companion", enforce_expiry=False, transport="rest", target="companion", request_class="companionHomeConfig")
+
+        with self.assertRaisesRegex(ValueError, "replayRejected"):
+            app.decrypt_secure_remote_dataplane_envelope(binding, envelope, "client_to_companion", enforce_expiry=False, transport="rest", target="companion", request_class="companionHomeConfig")
+
+    def test_secure_remote_inbound_websocket_replay_is_rejected_within_websocket_domain(self):
+        binding, _ = self._seed_secure_remote_dataplane_session()
+        envelope = self._client_to_companion_envelope(binding, {"type": "event"}, sequence=4, transport="webSocket", message_id="test-ws-4")
+        app.decrypt_secure_remote_dataplane_envelope(binding, envelope, "client_to_companion", enforce_expiry=False, transport="webSocket", target="ha", request_class="haWebSocket")
+
+        with self.assertRaisesRegex(ValueError, "replayRejected"):
+            app.decrypt_secure_remote_dataplane_envelope(binding, envelope, "client_to_companion", enforce_expiry=False, transport="webSocket", target="ha", request_class="haWebSocket")
+
+    def test_secure_remote_inbound_lower_sequence_is_rejected_within_same_transport(self):
+        binding, _ = self._seed_secure_remote_dataplane_session()
+        higher = self._client_to_companion_envelope(binding, {"type": "event", "id": 14}, sequence=14, transport="webSocket", message_id="test-ws-14")
+        lower = self._client_to_companion_envelope(binding, {"type": "event", "id": 12}, sequence=12, transport="webSocket", message_id="test-ws-12")
+        app.decrypt_secure_remote_dataplane_envelope(binding, higher, "client_to_companion", enforce_expiry=False, transport="webSocket", target="ha", request_class="haWebSocket")
+
+        with self.assertRaisesRegex(ValueError, "replayRejected"):
+            app.decrypt_secure_remote_dataplane_envelope(binding, lower, "client_to_companion", enforce_expiry=False, transport="webSocket", target="ha", request_class="haWebSocket")
+
+    def test_secure_remote_transport_substitution_fails_aad_authentication(self):
+        binding, _ = self._seed_secure_remote_dataplane_session()
+        rest_envelope = self._client_to_companion_envelope(
+            binding,
+            {"target": "companion", "method": "GET", "path": "/sosync/home-config"},
+            sequence=3,
+            transport="rest",
+            message_id="test-rest-3"
+        )
+
+        with self.assertRaisesRegex(ValueError, "decryptAuthenticationFailed"):
+            app.decrypt_secure_remote_dataplane_envelope(
+                binding,
+                rest_envelope,
+                "client_to_companion",
+                enforce_expiry=False,
+                transport="webSocket",
+                target="ha",
+                request_class="haWebSocket"
+            )
+
+    def test_secure_remote_new_session_generation_has_clean_replay_domain(self):
+        binding, _ = self._seed_secure_remote_dataplane_session()
+        first = self._client_to_companion_envelope(binding, {"target": "companion", "method": "GET", "path": "/sosync/home-config"}, sequence=9, transport="rest", message_id="test-rest-9")
+        app.decrypt_secure_remote_dataplane_envelope(binding, first, "client_to_companion", enforce_expiry=False, transport="rest", target="companion", request_class="companionHomeConfig")
+
+        app.SECURE_REMOTE_DATAPLANE_SESSIONS.pop((binding["route_id"], "session-home-config"))
+        binding, _ = self._seed_secure_remote_dataplane_session()
+        second = self._client_to_companion_envelope(binding, {"target": "companion", "method": "GET", "path": "/sosync/home-config"}, sequence=9, transport="rest", message_id="test-rest-9-new")
+        plaintext = app.decrypt_secure_remote_dataplane_envelope(binding, second, "client_to_companion", enforce_expiry=False, transport="rest", target="companion", request_class="companionHomeConfig")
+        self.assertEqual(json.loads(plaintext.decode("utf-8"))["target"], "companion")
 
     def test_secure_remote_companion_outbound_sequence_allocation_is_thread_safe(self):
         binding, _ = self._seed_secure_remote_dataplane_session()
@@ -872,7 +981,8 @@ class CompanionP03Tests(unittest.TestCase):
                     session["device_id"],
                     "companion_to_client",
                     envelope["sequence"],
-                    envelope["message_id"]
+                    envelope["message_id"],
+                    transport="webSocket"
                 )
                 plaintext = app.ChaCha20Poly1305(session["companion_key"]).decrypt(nonce, ciphertext, aad)
                 self.assertEqual(plaintext, ha_payload)
@@ -2483,11 +2593,13 @@ class CompanionP03Tests(unittest.TestCase):
         }
         return binding, headers
 
-    def _client_to_companion_envelope(self, binding, payload):
+    def _client_to_companion_envelope(self, binding, payload, sequence=None, transport="rest", message_id=None):
         session_id = "session-home-config"
         session = app.SECURE_REMOTE_DATAPLANE_SESSIONS[(binding["route_id"], session_id)]
-        sequence = int(session.get("highest_client_sequence") or 0) + 1
-        message_id = f"test-rest-{sequence}"
+        if sequence is None:
+            sequence = int(session.get("highest_client_sequence") or 0) + 1
+        if message_id is None:
+            message_id = f"test-{transport}-{sequence}"
         plaintext = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         nonce = os.urandom(12)
         aad = app.secure_remote_dataplane_aad(
@@ -2496,7 +2608,8 @@ class CompanionP03Tests(unittest.TestCase):
             session["device_id"],
             "client_to_companion",
             sequence,
-            message_id
+            message_id,
+            transport=transport
         )
         ciphertext = app.ChaCha20Poly1305(session["client_key"]).encrypt(nonce, plaintext, aad)
         return {
@@ -2535,7 +2648,8 @@ class CompanionP03Tests(unittest.TestCase):
             session["device_id"],
             "companion_to_client",
             sequence,
-            str(envelope.get("message_id") or "")
+            str(envelope.get("message_id") or ""),
+            transport="rest"
         )
         return app.ChaCha20Poly1305(session["companion_key"]).decrypt(
             app.base64url_decode(envelope["nonce"]),
