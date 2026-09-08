@@ -1226,6 +1226,111 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertNotIn("ha_access_token_should_not_log", logs)
         self.assertNotIn("raw_refresh_token", logs)
 
+    def test_secure_remote_encrypted_rest_companion_home_config_round_trip(self):
+        binding, headers = self._seed_secure_remote_dataplane_session()
+        body = {
+            "homeIdentity": "stable-home-identity"
+        }
+        payload = {
+            "target": "companion",
+            "method": "POST",
+            "path": "/sosync/home-config",
+            "headers": {"Accept": "application/json"},
+            "body_base64url": app.base64url_encode(json.dumps(body, separators=(",", ":")).encode("utf-8"))
+        }
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            with self._server() as base_url:
+                create_status, create_response = self._request_encrypted_rest(base_url, binding, headers, payload)
+                get_status, get_response = self._request_encrypted_rest(base_url, binding, headers, {
+                    "target": "companion",
+                    "method": "GET",
+                    "path": "/sosync/home-config?homeIdentity=stable-home-identity",
+                    "headers": {"Accept": "application/json"}
+                })
+                mutate_status, mutate_response = self._request_encrypted_rest(base_url, binding, headers, {
+                    "target": "companion",
+                    "method": "POST",
+                    "path": "/sosync/home-config/mutate",
+                    "headers": {"Accept": "application/json"},
+                    "body_base64url": app.base64url_encode(json.dumps({
+                        "homeIdentity": "stable-home-identity",
+                        "domain": "dashboards",
+                        "baseDomainRevision": 0,
+                        "patch": {
+                            "dashboards": [{"id": "dashboard-a", "name": "Home"}],
+                            "dashboardOrder": ["dashboard-a"],
+                            "dashboardWidgets": [{"id": "cover-widget", "type": "cover", "entityID": "cover.garage"}]
+                        }
+                    }, separators=(",", ":")).encode("utf-8"))
+                })
+
+        self.assertEqual(create_status, 200)
+        self.assertEqual(create_response["status"], 201)
+        self.assertEqual(get_status, 200)
+        self.assertEqual(get_response["status"], 200)
+        self.assertEqual(mutate_status, 200)
+        self.assertEqual(mutate_response["status"], 200)
+        mutated_body = json.loads(app.base64url_decode(mutate_response["body_base64url"]).decode("utf-8"))
+        self.assertEqual(mutated_body["dashboardWidgets"][0]["id"], "cover-widget")
+        self.assertEqual(mutated_body["domainRevisions"]["dashboards"], 1)
+        logs = captured.getvalue()
+        self.assertIn("[SOSYNC-SECURE-REMOTE-REST] phase=response target=companion method=POST pathClass=companionHomeConfig status=201 failureLayer=none requestEncrypted=true", logs)
+        self.assertIn("[SOSYNC-SECURE-REMOTE-REST] phase=response target=companion method=GET pathClass=companionHomeConfig status=200 failureLayer=none requestEncrypted=true", logs)
+        self.assertIn("[SOSYNC-SECURE-REMOTE-REST] phase=response target=companion method=POST pathClass=companionHomeConfigMutation status=200 failureLayer=none requestEncrypted=true", logs)
+
+    def test_secure_remote_encrypted_rest_unknown_companion_path_fails_closed(self):
+        binding, headers = self._seed_secure_remote_dataplane_session()
+
+        with self._server() as base_url:
+            status, response = self._request_json_response("POST", base_url, "/secure-remote/data-plane/e2ee/rest", self._client_to_companion_envelope(binding, {
+                "target": "companion",
+                "method": "GET",
+                "path": "/sosync/not-home-config",
+                "headers": {"Accept": "application/json"}
+            }), headers=headers)[:2]
+
+        self.assertEqual(status, 403)
+        self.assertEqual(response["error"], "companion_route_not_allowed")
+
+    def test_secure_remote_encrypted_rest_default_target_still_proxies_home_assistant(self):
+        binding, headers = self._seed_secure_remote_dataplane_session()
+        upstream_requests = []
+
+        class FakeHAHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                upstream_requests.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"states": []}')
+
+            def log_message(self, format, *args):
+                return
+
+        ha_server = ThreadingHTTPServer(("127.0.0.1", 0), FakeHAHandler)
+        ha_thread = threading.Thread(target=ha_server.serve_forever, daemon=True)
+        ha_thread.start()
+        host, port = ha_server.server_address
+        original_read_ha_upstream = app.read_ha_upstream
+        app.read_ha_upstream = lambda: f"http://{host}:{port}"
+        try:
+            with self._server() as base_url:
+                status, response = self._request_encrypted_rest(base_url, binding, headers, {
+                    "method": "GET",
+                    "path": "/api/states",
+                    "headers": {"Accept": "application/json"}
+                })
+        finally:
+            app.read_ha_upstream = original_read_ha_upstream
+            ha_server.shutdown()
+            ha_thread.join(timeout=2)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(upstream_requests, ["/api/states"])
+
     def test_cloudflare_connector_token_tunnel_identity_is_extracted_safely(self):
         tunnel_id = "cf_abcdefghijklmnopqrstuvwxyz123456"
         token = self._cloudflare_connector_token(tunnel_id)
@@ -2135,6 +2240,102 @@ class CompanionP03Tests(unittest.TestCase):
         record["status"] = status
         app.write_json_file_secure(app.E2EE_PAIRINGS_FILE, {"devices": {device_id: record}})
         return device_public_key
+
+    def _seed_secure_remote_dataplane_session(
+        self,
+        home_id="home_ref",
+        device_id="device_ref",
+        route_id="r_abcdefghijklmnopqrstuvwxyz123456",
+        tunnel_id="tun_abcdefghijklmnopqrstuvwxyz123456",
+        origin_token="orig_abcdefghijklmnopqrstuvwxyz123456",
+        session_id="session-home-config"
+    ):
+        device_public_key = self._seed_e2ee_pairing(home_id, device_id)
+        binding = app.make_secure_remote_binding(
+            self._secure_remote_binding_request(
+                home_id,
+                device_id,
+                device_public_key,
+                route_id=route_id,
+                tunnel_binding_id=tunnel_id,
+                origin_access_token=origin_token
+            )
+        )
+        app.write_json_file_secure(app.SECURE_REMOTE_BINDING_FILE, binding)
+        app.create_secure_remote_dataplane_session(binding, {
+            "protocol_version": 1,
+            "route_id": route_id,
+            "session_id": session_id,
+            "home_id": home_id,
+            "device_id": device_id,
+            "device_public_key": device_public_key,
+            "device_ephemeral_public_key": self._alternate_device_public_key()
+        })
+        headers = {
+            "X-SoSync-Secure-Remote-Route": tunnel_id,
+            "X-SoSync-Secure-Remote-Origin-Token": origin_token
+        }
+        return binding, headers
+
+    def _client_to_companion_envelope(self, binding, payload):
+        session_id = "session-home-config"
+        session = app.SECURE_REMOTE_DATAPLANE_SESSIONS[(binding["route_id"], session_id)]
+        sequence = int(session.get("highest_client_sequence") or 0) + 1
+        message_id = f"test-rest-{sequence}"
+        plaintext = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        nonce = os.urandom(12)
+        aad = app.secure_remote_dataplane_aad(
+            binding["route_id"],
+            session_id,
+            session["device_id"],
+            "client_to_companion",
+            sequence,
+            message_id
+        )
+        ciphertext = app.ChaCha20Poly1305(session["client_key"]).encrypt(nonce, plaintext, aad)
+        return {
+            "protocol_version": 1,
+            "route_id": binding["route_id"],
+            "session_id": session_id,
+            "device_id": session["device_id"],
+            "direction": "client_to_companion",
+            "sequence": sequence,
+            "message_id": message_id,
+            "nonce": app.base64url_encode(nonce),
+            "ciphertext": app.base64url_encode(ciphertext)
+        }
+
+    def _request_encrypted_rest(self, base_url, binding, headers, payload):
+        envelope = self._client_to_companion_envelope(binding, payload)
+        status, response_envelope, _ = self._request_json_response(
+            "POST",
+            base_url,
+            "/secure-remote/data-plane/e2ee/rest",
+            envelope,
+            headers=headers
+        )
+        if status != 200:
+            return status, response_envelope
+        response_plain = self._decrypt_companion_to_client_envelope(binding, response_envelope)
+        return status, json.loads(response_plain.decode("utf-8"))
+
+    def _decrypt_companion_to_client_envelope(self, binding, envelope):
+        session_id = envelope["session_id"]
+        session = app.SECURE_REMOTE_DATAPLANE_SESSIONS[(binding["route_id"], session_id)]
+        sequence = int(envelope["sequence"])
+        aad = app.secure_remote_dataplane_aad(
+            binding["route_id"],
+            session_id,
+            session["device_id"],
+            "companion_to_client",
+            sequence,
+            str(envelope.get("message_id") or "")
+        )
+        return app.ChaCha20Poly1305(session["companion_key"]).decrypt(
+            app.base64url_decode(envelope["nonce"]),
+            app.base64url_decode(envelope["ciphertext"]),
+            aad
+        )
 
     def _secure_remote_binding_request(
         self,
