@@ -715,6 +715,77 @@ class CompanionP03Tests(unittest.TestCase):
             )
         )
 
+    def test_secure_remote_companion_outbound_sequence_is_shared_for_rest_and_websocket(self):
+        binding, _ = self._seed_secure_remote_dataplane_session()
+        session_id = "session-home-config"
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            rest_envelope = app.encrypt_secure_remote_dataplane_envelope(
+                binding,
+                session_id,
+                b'{"status":200}',
+                "companion_to_client",
+                "rest-response-test",
+                transport="rest",
+                target="companion",
+                request_class="companionHomeConfig"
+            )
+            ws_envelope = app.encrypt_secure_remote_dataplane_envelope(
+                binding,
+                session_id,
+                b'{"type":"event"}',
+                "companion_to_client",
+                "ws-event-test",
+                enforce_expiry=False,
+                transport="webSocket",
+                target="ha",
+                request_class="haWebSocket"
+            )
+
+        self.assertEqual(rest_envelope["sequence"], 1)
+        self.assertEqual(ws_envelope["sequence"], 2)
+        logs = captured.getvalue()
+        self.assertIn("direction=outbound transport=rest target=companion requestClass=companionHomeConfig sequence=1", logs)
+        self.assertIn("direction=outbound transport=webSocket target=ha requestClass=haWebSocket sequence=2", logs)
+
+    def test_secure_remote_companion_outbound_sequence_allocation_is_thread_safe(self):
+        binding, _ = self._seed_secure_remote_dataplane_session()
+        session_id = "session-home-config"
+        sequences = []
+        errors = []
+        lock = threading.Lock()
+
+        def encrypt(index):
+            try:
+                envelope = app.encrypt_secure_remote_dataplane_envelope(
+                    binding,
+                    session_id,
+                    f'{{"index":{index}}}'.encode("utf-8"),
+                    "companion_to_client",
+                    f"mixed-{index}",
+                    enforce_expiry=False,
+                    transport="webSocket" if index % 2 else "rest",
+                    target="ha" if index % 2 else "companion",
+                    request_class="haWebSocket" if index % 2 else "companionHomeConfig"
+                )
+                with lock:
+                    sequences.append(envelope["sequence"])
+            except Exception as error:
+                with lock:
+                    errors.append(error)
+
+        threads = [threading.Thread(target=encrypt, args=(index,)) for index in range(1, 25)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(sequences), 24)
+        self.assertEqual(sorted(sequences), list(range(1, 25)))
+        self.assertEqual(len(set(sequences)), 24)
+
     def test_secure_remote_websocket_upstream_ping_is_not_forwarded_as_encrypted_ha_payload(self):
         binding = {"route_id": "r_abcdefghijklmnopqrstuvwxyz123456", "status": "active"}
         session_id = "session-control-frame"

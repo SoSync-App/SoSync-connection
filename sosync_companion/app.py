@@ -1490,7 +1490,14 @@ class Handler(BaseHTTPRequestHandler):
                 print("[SOSYNC-COMPANION-E2EE-REST] phase=envelopeParseCompleted result=rejected exception=ValueError reason=malformedOuterEnvelope", flush=True)
                 raise ValueError("malformedOuterEnvelope")
             print("[SOSYNC-COMPANION-E2EE-REST] phase=envelopeParseCompleted result=accepted", flush=True)
-            plain = decrypt_secure_remote_dataplane_envelope(binding, envelope, "client_to_companion")
+            plain = decrypt_secure_remote_dataplane_envelope(
+                binding,
+                envelope,
+                "client_to_companion",
+                transport="rest",
+                target="unknown",
+                request_class="e2eeRestRequest"
+            )
             print("[SOSYNC-COMPANION-E2EE-REST] phase=plaintextJSONParseStarted", flush=True)
             try:
                 plain_text = plain.decode("utf-8")
@@ -1563,7 +1570,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(403, {"error": "target_not_allowed"})
                 return
             response_plain = json.dumps(response, separators=(",", ":")).encode("utf-8")
-            response_envelope = encrypt_secure_remote_dataplane_envelope(binding, envelope.get("session_id"), response_plain, "companion_to_client", f"rest-response-{uuid.uuid4()}")
+            response_envelope = encrypt_secure_remote_dataplane_envelope(
+                binding,
+                envelope.get("session_id"),
+                response_plain,
+                "companion_to_client",
+                f"rest-response-{uuid.uuid4()}",
+                transport="rest",
+                target=rest_target,
+                request_class=path_class
+            )
             failure_layer = "none" if 200 <= int(response.get("status") or 0) < 300 else "http"
             print(
                 f"[SOSYNC-SECURE-REMOTE-REST] phase=response target={rest_target} method={method} pathClass={path_class} status={response.get('status')} failureLayer={failure_layer} requestEncrypted=true",
@@ -2538,6 +2554,7 @@ def create_secure_remote_dataplane_session(binding, request, request_id="unknown
         "companion_ephemeral_public_key": companion_ephemeral_public_key,
         "client_key": hkdf_dataplane_key(shared, context, b"|client_to_companion"),
         "companion_key": hkdf_dataplane_key(shared, context, b"|companion_to_client"),
+        "session_generation": 1,
         "highest_client_sequence": 0,
         "next_companion_sequence": 1,
         "expires_at": time.time() + 60,
@@ -2592,7 +2609,63 @@ def secure_remote_dataplane_aad(route_id, session_id, device_id, direction, sequ
     return f"v=1|route={route_id}|session={session_id}|device={device_id}|direction={direction}|sequence={sequence}|message={message_id}".encode("utf-8")
 
 
-def decrypt_secure_remote_dataplane_envelope(binding, envelope, expected_direction, enforce_expiry=True):
+def log_secure_remote_sequence(session, direction, transport, target, request_class, sequence, previous_accepted_sequence, validation_result):
+    session_id = session.get("session_id") if isinstance(session, dict) else None
+    session_generation = session.get("session_generation", "unknown") if isinstance(session, dict) else "unknown"
+    print(
+        "[SOSYNC-SECURE-REMOTE-SEQUENCE] "
+        f"sessionIDHash={safe_fingerprint(session_id)} "
+        f"sessionGeneration={session_generation} "
+        f"direction={direction} "
+        f"transport={transport} "
+        f"target={target} "
+        f"requestClass={request_class} "
+        f"sequence={sequence} "
+        f"previousAcceptedSequence={previous_accepted_sequence} "
+        f"validationResult={validation_result}",
+        flush=True
+    )
+
+
+def validate_client_sequence_before_decrypt(binding, session, sequence, transport, target, request_class):
+    with timed_lock(SECURE_REMOTE_DATAPLANE_LOCK, "dataplaneClientSequenceValidate", log_threshold_ms=10):
+        current = SECURE_REMOTE_DATAPLANE_SESSIONS.get((binding.get("route_id"), session["session_id"]))
+        previous = int((current or session).get("highest_client_sequence") or 0)
+        accepted = current is not None and sequence > previous
+    log_secure_remote_sequence(session, "inbound", transport, target, request_class, sequence, previous, "accepted" if accepted else "rejected")
+    if not accepted:
+        raise ValueError("replayRejected")
+
+
+def record_client_sequence_after_decrypt(binding, session, sequence, transport, target, request_class):
+    with timed_lock(SECURE_REMOTE_DATAPLANE_LOCK, "dataplaneClientSequenceUpdate", log_threshold_ms=10):
+        current = SECURE_REMOTE_DATAPLANE_SESSIONS.get((binding.get("route_id"), session["session_id"]))
+        previous = int((current or session).get("highest_client_sequence") or 0)
+        if current is None or sequence <= previous:
+            log_secure_remote_sequence(session, "inbound", transport, target, request_class, sequence, previous, "rejected")
+            raise ValueError("replayRejected")
+        current["highest_client_sequence"] = sequence
+        SECURE_REMOTE_DATAPLANE_SESSIONS[(binding.get("route_id"), current["session_id"])] = current
+
+
+def allocate_companion_sequence(binding, session_id, enforce_expiry, transport, target, request_class):
+    key = (binding.get("route_id"), str(session_id or ""))
+    with timed_lock(SECURE_REMOTE_DATAPLANE_LOCK, "dataplaneCompanionSequenceAllocate", log_threshold_ms=10):
+        session = SECURE_REMOTE_DATAPLANE_SESSIONS.get(key)
+        if not session or (enforce_expiry and session.get("expires_at", 0) < time.time()):
+            SECURE_REMOTE_DATAPLANE_SESSIONS.pop(key, None)
+            raise ValueError("encrypted_session_required")
+        sequence = int(session.get("next_companion_sequence") or 1)
+        if sequence >= 2**64 - 1:
+            raise ValueError("sequence_exhausted")
+        previous = sequence - 1
+        session["next_companion_sequence"] = sequence + 1
+        SECURE_REMOTE_DATAPLANE_SESSIONS[key] = session
+    log_secure_remote_sequence(session, "outbound", transport, target, request_class, sequence, previous, "allocated")
+    return session, sequence
+
+
+def decrypt_secure_remote_dataplane_envelope(binding, envelope, expected_direction, enforce_expiry=True, transport="rest", target="unknown", request_class="unknown"):
     decrypt_started_at = time.monotonic()
     print("[SOSYNC-COMPANION-E2EE-REST] phase=sessionLookupStarted", flush=True)
     session_lookup_started_at = time.monotonic()
@@ -2621,9 +2694,11 @@ def decrypt_secure_remote_dataplane_envelope(binding, envelope, expected_directi
         print("[SOSYNC-COMPANION-E2EE-REST] phase=sequenceParseCompleted result=rejected exception=ValueError reason=invalidSequence", flush=True)
         raise ValueError("invalidSequence")
     print("[SOSYNC-COMPANION-E2EE-REST] phase=sequenceParseCompleted result=accepted", flush=True)
-    if sequence <= int(session.get("highest_client_sequence") or 0):
+    try:
+        validate_client_sequence_before_decrypt(binding, session, sequence, transport, target, request_class)
+    except ValueError:
         print("[SOSYNC-COMPANION-E2EE-REST] phase=sequenceParseCompleted result=rejected exception=ValueError reason=replayRejected", flush=True)
-        raise ValueError("replayRejected")
+        raise
     print("[SOSYNC-COMPANION-E2EE-REST] phase=nonceDecodeStarted", flush=True)
     try:
         nonce = base64url_decode(envelope.get("nonce") or "")
@@ -2655,9 +2730,7 @@ def decrypt_secure_remote_dataplane_envelope(binding, envelope, expected_directi
     print("[SOSYNC-COMPANION-E2EE-REST] phase=decryptCompleted result=accepted", flush=True)
     crypto_core_ms = elapsed_ms_since(crypto_core_started_at)
     session_update_started_at = time.monotonic()
-    with timed_lock(SECURE_REMOTE_DATAPLANE_LOCK, "dataplaneSessionUpdate", log_threshold_ms=10):
-        session["highest_client_sequence"] = sequence
-        SECURE_REMOTE_DATAPLANE_SESSIONS[(binding.get("route_id"), session["session_id"])] = session
+    record_client_sequence_after_decrypt(binding, session, sequence, transport, target, request_class)
     session_update_ms = elapsed_ms_since(session_update_started_at)
     companion_perf_log_if_slow(
         "cryptoCompleted",
@@ -2674,24 +2747,17 @@ def decrypt_secure_remote_dataplane_envelope(binding, envelope, expected_directi
     return plaintext
 
 
-def encrypt_secure_remote_dataplane_envelope(binding, session_id, plaintext, direction, message_id, enforce_expiry=True):
+def encrypt_secure_remote_dataplane_envelope(binding, session_id, plaintext, direction, message_id, enforce_expiry=True, transport="rest", target="unknown", request_class="unknown"):
     encrypt_started_at = time.monotonic()
     session_lookup_started_at = time.monotonic()
-    session = secure_remote_dataplane_session(binding, session_id, enforce_expiry=enforce_expiry)
+    session, sequence = allocate_companion_sequence(binding, session_id, enforce_expiry, transport, target, request_class)
     session_lookup_ms = elapsed_ms_since(session_lookup_started_at)
-    if not session:
-        raise ValueError("encrypted_session_required")
-    sequence = int(session.get("next_companion_sequence") or 1)
-    session["next_companion_sequence"] = sequence + 1
     nonce = os.urandom(12)
     aad = secure_remote_dataplane_aad(binding.get("route_id"), session["session_id"], session["device_id"], direction, sequence, message_id)
     crypto_core_started_at = time.monotonic()
     ciphertext = ChaCha20Poly1305(session["companion_key"]).encrypt(nonce, plaintext, aad)
     crypto_core_ms = elapsed_ms_since(crypto_core_started_at)
-    session_update_started_at = time.monotonic()
-    with timed_lock(SECURE_REMOTE_DATAPLANE_LOCK, "dataplaneSessionUpdate", log_threshold_ms=10):
-        SECURE_REMOTE_DATAPLANE_SESSIONS[(binding.get("route_id"), session["session_id"])] = session
-    session_update_ms = elapsed_ms_since(session_update_started_at)
+    session_update_ms = 0
     envelope_started_at = time.monotonic()
     envelope = {
         "protocol_version": 1,
@@ -3127,7 +3193,15 @@ def bridge_secure_remote_dataplane_websocket(client_socket, upstream_socket, bin
                     envelope = json.loads(payload.decode("utf-8"))
                     command_id = envelope.get("message_id") if isinstance(envelope, dict) else None
                     decrypt_started_at = time.monotonic()
-                    plaintext = decrypt_secure_remote_dataplane_envelope(binding, envelope, "client_to_companion", enforce_expiry=False)
+                    plaintext = decrypt_secure_remote_dataplane_envelope(
+                        binding,
+                        envelope,
+                        "client_to_companion",
+                        enforce_expiry=False,
+                        transport="webSocket",
+                        target="ha",
+                        request_class="haWebSocket"
+                    )
                     try:
                         decoded_client_object = json.loads(plaintext.decode("utf-8"))
                     except Exception:
@@ -3308,7 +3382,17 @@ def bridge_secure_remote_dataplane_websocket(client_socket, upstream_socket, bin
                             )
                             command_timings[response_ha_command_id]["response_encrypt_started_at"] = time.monotonic()
                     response_encrypt_started_at = time.monotonic()
-                    envelope = encrypt_secure_remote_dataplane_envelope(binding, session_id, payload, "companion_to_client", f"ws-event-{uuid.uuid4()}", enforce_expiry=False)
+                    envelope = encrypt_secure_remote_dataplane_envelope(
+                        binding,
+                        session_id,
+                        payload,
+                        "companion_to_client",
+                        f"ws-event-{uuid.uuid4()}",
+                        enforce_expiry=False,
+                        transport="webSocket",
+                        target="ha",
+                        request_class="haWebSocket"
+                    )
                     if response_command_id:
                         response_target_count = command_timings.get(response_ha_command_id, {}).get("target_count", 0)
                         response_encrypt_started_at = command_timings.get(response_ha_command_id, {}).get("response_encrypt_started_at", response_encrypt_started_at)
