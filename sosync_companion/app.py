@@ -749,8 +749,8 @@ class Handler(BaseHTTPRequestHandler):
             remote_url = read_remote_url()
             companion_identity_server_perf("remoteURLLookupCompleted", request_id, identity_started_at)
             companion_identity_server_perf("cloudflaredStatusStarted", request_id, identity_started_at)
-            runtime = cloudflared_runtime_status()
-            companion_identity_server_perf("cloudflaredStatusCompleted", request_id, identity_started_at)
+            runtime = cloudflared_runtime_status_for_identity()
+            companion_identity_server_perf("cloudflaredStatusCompleted", request_id, identity_started_at, source="cacheOnly")
             companion_identity_server_perf("secureRemoteStatusSnapshotStarted", request_id, identity_started_at)
             secure_remote_status = secure_remote_identity_snapshot_status()
             companion_identity_server_perf(
@@ -1483,16 +1483,37 @@ class Handler(BaseHTTPRequestHandler):
             envelope = self._read_json_body(256 * 1024)
             plain = decrypt_secure_remote_dataplane_envelope(binding, envelope, "client_to_companion")
             request = json.loads(plain.decode("utf-8"))
-            ha_path = str(request.get("path") or "/")
+            rest_target = str(request.get("target") or "ha").strip().lower()
+            rest_path = str(request.get("path") or "/")
             method = str(request.get("method") or "GET").upper()
-            if not is_allowed_ha_path(ha_path) and not (ha_path == "/auth/token" and method == "POST"):
-                self._json(403, {"error": "route_not_allowed"})
+            if rest_target == "ha":
+                if not is_allowed_ha_path(rest_path) and not (rest_path == "/auth/token" and method == "POST"):
+                    self._json(403, {"error": "route_not_allowed"})
+                    return
+                response = perform_secure_remote_dataplane_rest(method, rest_path, request.get("headers") or {}, request.get("body_base64url"))
+                path_class = ha_path_class_for_log(rest_path)
+            elif rest_target == "companion":
+                if not is_allowed_secure_remote_companion_rest_path(rest_path):
+                    print(
+                        f"[SOSYNC-SECURE-REMOTE-REST] phase=response target=companion method={method} pathClass={companion_rest_path_class_for_log(rest_path)} status=403 failureLayer=companionOrigin requestEncrypted=true",
+                        flush=True
+                    )
+                    self._json(403, {"error": "companion_route_not_allowed"})
+                    return
+                response = perform_secure_remote_companion_rest(method, rest_path, request.get("body_base64url"))
+                path_class = companion_rest_path_class_for_log(rest_path)
+            else:
+                self._json(403, {"error": "target_not_allowed"})
                 return
-            response = perform_secure_remote_dataplane_rest(method, ha_path, request.get("headers") or {}, request.get("body_base64url"))
             response_plain = json.dumps(response, separators=(",", ":")).encode("utf-8")
             response_envelope = encrypt_secure_remote_dataplane_envelope(binding, envelope.get("session_id"), response_plain, "companion_to_client", f"rest-response-{uuid.uuid4()}")
+            failure_layer = "none" if 200 <= int(response.get("status") or 0) < 300 else "http"
             print(
-                f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedRESTComplete route={safe_fingerprint(binding.get('route_id'))} pathClass={ha_path_class_for_log(ha_path)} upstreamStatus={response.get('status')} companionDecryption=true plaintextHATokenAtWorker=false",
+                f"[SOSYNC-SECURE-REMOTE-REST] phase=response target={rest_target} method={method} pathClass={path_class} status={response.get('status')} failureLayer={failure_layer} requestEncrypted=true",
+                flush=True
+            )
+            print(
+                f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedRESTComplete route={safe_fingerprint(binding.get('route_id'))} target={rest_target} pathClass={path_class} upstreamStatus={response.get('status')} companionDecryption=true plaintextHATokenAtWorker=false",
                 flush=True
             )
             self._json(200, response_envelope)
@@ -2689,6 +2710,185 @@ def perform_secure_remote_dataplane_rest(method, ha_path, headers, body_base64ur
             "headers": {"Content-Type": error.headers.get("Content-Type", "application/json")},
             "body_base64url": base64url_encode(body) if body else None
         }
+
+
+def is_allowed_secure_remote_companion_rest_path(path):
+    request_path = urlparse(path or "/").path
+    return request_path in (HOME_CONFIGURATION_PATH, HOME_CONFIGURATION_MUTATION_PATH)
+
+
+def companion_rest_path_class_for_log(path):
+    request_path = urlparse(path or "/").path
+    if request_path == HOME_CONFIGURATION_PATH:
+        return "companionHomeConfig"
+    if request_path == HOME_CONFIGURATION_MUTATION_PATH:
+        return "companionHomeConfigMutation"
+    return "companionRejected"
+
+
+def secure_remote_json_rest_response(status, body):
+    response_body = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    return {
+        "status": status,
+        "headers": {"Content-Type": "application/json"},
+        "body_base64url": base64url_encode(response_body) if response_body else None
+    }
+
+
+def decode_secure_remote_companion_rest_body(body_base64url):
+    if not body_base64url:
+        return {}
+    body = base64url_decode(body_base64url)
+    if len(body) > MAX_HOME_CONFIGURATION_BYTES:
+        raise ValueError("body_too_large")
+    decoded = json.loads(body.decode("utf-8"))
+    if not isinstance(decoded, dict):
+        raise ValueError("body_not_json_object")
+    return decoded
+
+
+def perform_secure_remote_companion_rest(method, companion_path, body_base64url):
+    parsed = urlparse(companion_path or "/")
+    request_path = parsed.path
+    if request_path == HOME_CONFIGURATION_PATH and method == "GET":
+        expected_home_identity = parse_qs(parsed.query).get("homeIdentity", [""])[0]
+        if not is_valid_home_config_identity(expected_home_identity):
+            log_home_config("identityMismatch", operation="load", reason="invalidExpectedIdentity")
+            return secure_remote_json_rest_response(400, {"error": "invalid_home_identity"})
+        log_home_config("loadStarted", source="secureRemoteCompanion", homeHash=safe_fingerprint(expected_home_identity))
+        try:
+            document = read_home_configuration_document()
+        except HomeConfigurationPersistenceError as error:
+            log_home_config("persistenceFailure", operation="load", reason=error.reason)
+            return secure_remote_json_rest_response(500, {"error": "home_config_persistence_failure", "reason": error.reason})
+        if document is None:
+            log_home_config("loadCompleted", source="secureRemoteCompanion", result="notFound", homeHash=safe_fingerprint(expected_home_identity))
+            return secure_remote_json_rest_response(404, {"error": "not_found"})
+        if document.get("homeIdentity") != expected_home_identity:
+            log_home_config(
+                "identityMismatch",
+                operation="load",
+                expectedHash=safe_fingerprint(expected_home_identity),
+                actualHash=safe_fingerprint(str(document.get("homeIdentity") or ""))
+            )
+            return secure_remote_json_rest_response(403, {"error": "home_identity_mismatch"})
+        log_home_config(
+            "loadCompleted",
+            source="secureRemoteCompanion",
+            result="success",
+            homeHash=safe_fingerprint(expected_home_identity),
+            revision=document.get("revision", "unknown"),
+            domainRevisions=home_config_domain_revision_summary(document)
+        )
+        return secure_remote_json_rest_response(200, document)
+
+    if request_path == HOME_CONFIGURATION_PATH and method == "POST":
+        try:
+            request = decode_secure_remote_companion_rest_body(body_base64url)
+        except ValueError as error:
+            return secure_remote_json_rest_response(400, {"error": str(error)})
+        home_identity = str(request.get("homeIdentity") or "").strip()
+        if not is_valid_home_config_identity(home_identity):
+            log_home_config("identityMismatch", operation="create", reason="invalidHomeIdentity")
+            return secure_remote_json_rest_response(400, {"error": "invalid_home_identity"})
+        log_home_config("createStarted", source="secureRemoteCompanion", homeHash=safe_fingerprint(home_identity))
+        try:
+            document, created = create_home_configuration_if_absent(home_identity)
+        except HomeConfigurationIdentityMismatchError as error:
+            log_home_config(
+                "identityMismatch",
+                operation="create",
+                expectedHash=safe_fingerprint(error.expected),
+                actualHash=safe_fingerprint(error.actual)
+            )
+            return secure_remote_json_rest_response(403, {"error": "home_identity_mismatch"})
+        except HomeConfigurationPersistenceError as error:
+            log_home_config("persistenceFailure", operation="create", reason=error.reason)
+            return secure_remote_json_rest_response(500, {"error": "home_config_persistence_failure", "reason": error.reason})
+        log_home_config(
+            "createCompleted",
+            source="secureRemoteCompanion",
+            result="created" if created else "alreadyExists",
+            homeHash=safe_fingerprint(home_identity),
+            revision=document.get("revision", "unknown")
+        )
+        return secure_remote_json_rest_response(201 if created else 200, document)
+
+    if request_path == HOME_CONFIGURATION_MUTATION_PATH and method == "POST":
+        try:
+            request = decode_secure_remote_companion_rest_body(body_base64url)
+        except ValueError as error:
+            return secure_remote_json_rest_response(400, {"error": str(error)})
+        home_identity = str(request.get("homeIdentity") or "").strip()
+        domain = str(request.get("domain") or "").strip()
+        base_domain_revision = request.get("baseDomainRevision")
+        updated_by_device = request.get("updatedByDeviceIDHash")
+        patch = request.get("patch")
+        if not is_valid_home_config_identity(home_identity):
+            log_home_config("identityMismatch", operation="mutation", reason="invalidHomeIdentity")
+            return secure_remote_json_rest_response(400, {"error": "invalid_home_identity"})
+        if domain not in HOME_CONFIG_DOMAINS:
+            return secure_remote_json_rest_response(400, {"error": "invalid_domain"})
+        if not isinstance(base_domain_revision, int) or base_domain_revision < 0:
+            return secure_remote_json_rest_response(400, {"error": "invalid_base_domain_revision"})
+        if updated_by_device is not None and not isinstance(updated_by_device, str):
+            return secure_remote_json_rest_response(400, {"error": "invalid_updated_by_device"})
+        log_home_config(
+            "mutationStarted",
+            source="secureRemoteCompanion",
+            homeHash=safe_fingerprint(home_identity),
+            domain=domain,
+            baseDomainRevision=base_domain_revision
+        )
+        try:
+            document = mutate_home_configuration(
+                home_identity=home_identity,
+                domain=domain,
+                base_domain_revision=base_domain_revision,
+                patch=patch,
+                updated_by_device_hash=updated_by_device
+            )
+        except HomeConfigurationIdentityMismatchError as error:
+            log_home_config(
+                "identityMismatch",
+                operation="mutation",
+                expectedHash=safe_fingerprint(error.expected),
+                actualHash=safe_fingerprint(error.actual)
+            )
+            return secure_remote_json_rest_response(403, {"error": "home_identity_mismatch"})
+        except HomeConfigurationConflictError as error:
+            log_home_config(
+                "conflict",
+                source="secureRemoteCompanion",
+                homeHash=safe_fingerprint(home_identity),
+                domain=domain,
+                attemptedBaseDomainRevision=error.attempted,
+                currentDomainRevision=error.current_domain_revision,
+                currentRevision=error.current_revision
+            )
+            return secure_remote_json_rest_response(409, {
+                "error": "revision_conflict",
+                "domain": domain,
+                "currentRevision": error.current_revision,
+                "currentDomainRevision": error.current_domain_revision,
+                "attemptedBaseDomainRevision": error.attempted
+            })
+        except HomeConfigurationValidationError as error:
+            return secure_remote_json_rest_response(400, {"error": error.reason})
+        except HomeConfigurationPersistenceError as error:
+            log_home_config("persistenceFailure", operation="mutation", reason=error.reason)
+            return secure_remote_json_rest_response(500, {"error": "home_config_persistence_failure", "reason": error.reason})
+        log_home_config(
+            "mutationCommitted",
+            source="secureRemoteCompanion",
+            homeHash=safe_fingerprint(home_identity),
+            domain=domain,
+            revision=document.get("revision", "unknown"),
+            domainRevision=document.get("domainRevisions", {}).get(domain, "unknown")
+        )
+        return secure_remote_json_rest_response(200, document)
+
+    return secure_remote_json_rest_response(405, {"error": "method_not_allowed"})
 
 
 def bridge_secure_remote_dataplane_websocket(client_socket, upstream_socket, binding, session_id, request_id="unknown", timing_started_at=None):
@@ -4815,6 +5015,23 @@ def cloudflared_runtime_status():
     CLOUDFLARED_RUNTIME_STATUS_CACHE = dict(status)
     CLOUDFLARED_RUNTIME_STATUS_CACHE_EXPIRES_AT = time.monotonic() + 60
     companion_perf_log("cloudflaredRuntimeComputed", elapsedMs=elapsed_ms_since(started_at), available=True)
+    return status
+
+
+def cloudflared_runtime_status_for_identity():
+    if CLOUDFLARED_RUNTIME_STATUS_CACHE and CLOUDFLARED_RUNTIME_STATUS_CACHE_EXPIRES_AT > time.monotonic():
+        companion_perf_log("cloudflaredRuntimeIdentityCacheHit")
+        return dict(CLOUDFLARED_RUNTIME_STATUS_CACHE)
+    started_at = time.monotonic()
+    cloudflared_binary = os.environ.get("SOSYNC_CLOUDFLARED_BIN", "cloudflared")
+    resolved = shutil.which(cloudflared_binary)
+    status = {"available": bool(resolved), "path": resolved, "version": None}
+    companion_perf_log(
+        "cloudflaredRuntimeIdentityFastPath",
+        elapsedMs=elapsed_ms_since(started_at),
+        available=status["available"],
+        versionSource="cacheOnly"
+    )
     return status
 
 
