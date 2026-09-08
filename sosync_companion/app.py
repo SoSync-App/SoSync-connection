@@ -110,6 +110,7 @@ COMPANION_RUNTIME_HEARTBEAT_STOP = threading.Event()
 COMPANION_IDENTITY_CACHE = None
 E2EE_IDENTITY_CACHE = None
 E2EE_PUBLIC_KEY_NORMALIZATION_CACHE = {}
+E2EE_PUBLIC_KEY_IMPORT_CACHE = {}
 E2EE_PUBLIC_KEY_NORMALIZATION_LOCK = threading.Lock()
 COMPANION_JSON_READ_CACHE = {}
 CLOUDFLARED_RUNTIME_STATUS_CACHE = None
@@ -2528,11 +2529,36 @@ def create_secure_remote_dataplane_session(binding, request, request_id="unknown
 
     log_e2ee_session_timing(request_id, timing_started_at, "cryptoKeyDerivationStarted")
     crypto_started_at = time.monotonic()
+    companion_ephemeral_started_at = time.monotonic()
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionCompanionEphemeralGenerateStarted")
     companion_ephemeral = x25519.X25519PrivateKey.generate()
     companion_ephemeral_public_key = base64url_encode(companion_ephemeral.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
-    shared = x25519.X25519PrivateKey.from_private_bytes(base64url_decode(identity["private_key"])).exchange(
-        x25519.X25519PublicKey.from_public_bytes(base64url_decode(device_public_key))
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionCompanionEphemeralGenerateCompleted")
+    companion_ephemeral_ms = elapsed_ms_since(companion_ephemeral_started_at)
+    device_import_started_at = time.monotonic()
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionDevicePublicKeyImportForExchangeStarted")
+    device_public_key_for_exchange = imported_e2ee_public_key(
+        device_public_key,
+        request_id=request_id,
+        timing_started_at=timing_started_at,
+        label="sessionDevicePublicKey"
     )
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionDevicePublicKeyImportForExchangeCompleted")
+    device_public_key_import_ms = elapsed_ms_since(device_import_started_at)
+    if device_public_key_for_exchange is None:
+        raise ValueError("invalid_dataplane_session")
+    private_import_started_at = time.monotonic()
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionCompanionPrivateKeyImportStarted")
+    companion_private_key = x25519.X25519PrivateKey.from_private_bytes(base64url_decode(identity["private_key"]))
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionCompanionPrivateKeyImportCompleted")
+    companion_private_key_import_ms = elapsed_ms_since(private_import_started_at)
+    exchange_started_at = time.monotonic()
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionSharedSecretExchangeStarted")
+    shared = companion_private_key.exchange(device_public_key_for_exchange)
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionSharedSecretExchangeCompleted")
+    shared_secret_exchange_ms = elapsed_ms_since(exchange_started_at)
+    context_started_at = time.monotonic()
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionContextConstructionStarted")
     context = secure_remote_dataplane_context(
         route_id,
         session_id,
@@ -2543,17 +2569,41 @@ def create_secure_remote_dataplane_session(binding, request, request_id="unknown
         device_ephemeral_public_key,
         companion_ephemeral_public_key
     )
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionContextConstructionCompleted")
+    context_construction_ms = elapsed_ms_since(context_started_at)
     log_e2ee_session_timing(request_id, timing_started_at, "cryptoKeyDerivationCompleted")
-    companion_perf_log("cryptoCompleted", operation="sessionKeyDerivation", requestID=request_id, elapsedMs=elapsed_ms_since(crypto_started_at))
+    companion_perf_log(
+        "cryptoCompleted",
+        operation="sessionKeyDerivation",
+        requestID=request_id,
+        elapsedMs=elapsed_ms_since(crypto_started_at),
+        companionEphemeralMs=companion_ephemeral_ms,
+        devicePublicKeyImportMs=device_public_key_import_ms,
+        companionPrivateKeyImportMs=companion_private_key_import_ms,
+        sharedSecretExchangeMs=shared_secret_exchange_ms,
+        contextConstructionMs=context_construction_ms
+    )
     log_e2ee_session_timing(request_id, timing_started_at, "sessionObjectCreationStarted")
+    client_key_started_at = time.monotonic()
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionClientKeyDerivationStarted")
+    client_key = hkdf_dataplane_key(shared, context, b"|client_to_companion")
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionClientKeyDerivationCompleted")
+    client_key_ms = elapsed_ms_since(client_key_started_at)
+    companion_key_started_at = time.monotonic()
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionCompanionKeyDerivationStarted")
+    companion_key = hkdf_dataplane_key(shared, context, b"|companion_to_client")
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionCompanionKeyDerivationCompleted")
+    companion_key_ms = elapsed_ms_since(companion_key_started_at)
+    session_dict_started_at = time.monotonic()
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionDictConstructionStarted")
     session = {
         "session_id": session_id,
         "route_id": route_id,
         "home_id": home_id,
         "device_id": device_id,
         "companion_ephemeral_public_key": companion_ephemeral_public_key,
-        "client_key": hkdf_dataplane_key(shared, context, b"|client_to_companion"),
-        "companion_key": hkdf_dataplane_key(shared, context, b"|companion_to_client"),
+        "client_key": client_key,
+        "companion_key": companion_key,
         "session_generation": 1,
         "highest_client_sequence": 0,
         "highest_client_sequence_by_transport": {},
@@ -2561,6 +2611,14 @@ def create_secure_remote_dataplane_session(binding, request, request_id="unknown
         "expires_at": time.time() + 60,
         "expires_in_seconds": 60
     }
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionDictConstructionCompleted")
+    companion_perf_log(
+        "sessionObjectCreationCompleted",
+        requestID=request_id,
+        elapsedMs=elapsed_ms_since(session_dict_started_at),
+        clientKeyMs=client_key_ms,
+        companionKeyMs=companion_key_ms
+    )
     log_e2ee_session_timing(request_id, timing_started_at, "sessionObjectCreationCompleted")
     lock_started_at = time.monotonic()
     log_e2ee_session_timing(request_id, timing_started_at, "dataplaneSessionLockWaitStarted")
@@ -4005,6 +4063,22 @@ def prewarm_e2ee_identity_cache():
         )
 
 
+def prewarm_e2ee_crypto_primitives():
+    started_at = time.monotonic()
+    try:
+        x25519.X25519PublicKey.from_public_bytes(bytes([9]) + bytes(31))
+        HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=b"sosync-secure-remote-dataplane-v1",
+            info=b"sosync-companion-e2ee-prewarm",
+        ).derive(bytes(32))
+        ChaCha20Poly1305(bytes(32)).encrypt(bytes(12), b"", b"sosync-companion-e2ee-prewarm")
+        companion_perf_log("e2eeCryptoPrewarmCompleted", elapsedMs=elapsed_ms_since(started_at))
+    except BaseException as error:
+        companion_perf_log("e2eeCryptoPrewarmFailed", elapsedMs=elapsed_ms_since(started_at), error=type(error).__name__)
+
+
 def read_e2ee_pairings():
     pairings = read_json_file(E2EE_PAIRINGS_FILE, {"devices": {}}, cache_ttl_seconds=0.25)
     if not isinstance(pairings, dict):
@@ -4021,6 +4095,52 @@ def log_e2ee_pairing_store_loaded():
         f"[SOSYNC-E2EE-COMPANION] pairingStoreLoaded count={count} storage=/data/sosync_e2ee_pairings.json",
         flush=True
     )
+
+
+def prewarm_e2ee_pairing_public_key_cache():
+    started_at = time.monotonic()
+    pairings = read_e2ee_pairings().get("devices", {})
+    prewarmed = 0
+    invalid = 0
+    for device_id, pairing in pairings.items():
+        if not isinstance(pairing, dict) or pairing.get("status") != "active":
+            continue
+        normalized = normalized_e2ee_public_key(
+            pairing.get("device_public_key"),
+            request_id="startup",
+            timing_started_at=started_at,
+            label="pairingStoreDevicePublicKey"
+        )
+        imported = imported_e2ee_public_key(
+            normalized,
+            request_id="startup",
+            timing_started_at=started_at,
+            label="pairingStoreDevicePublicKey"
+        ) if normalized else None
+        if imported is not None:
+            prewarmed += 1
+        else:
+            invalid += 1
+            print(
+                "[SOSYNC-E2EE-COMPANION] "
+                "pairingPublicKeyPrewarmSkipped "
+                f"deviceHash={safe_fingerprint(str(device_id or ''))} "
+                "reason=invalidPublicKey",
+                flush=True
+            )
+    companion_perf_log(
+        "e2eePairingPublicKeyPrewarmCompleted",
+        elapsedMs=elapsed_ms_since(started_at),
+        activePairingCount=count_active_e2ee_pairings(pairings),
+        prewarmed=prewarmed,
+        invalid=invalid
+    )
+
+
+def count_active_e2ee_pairings(pairings):
+    if not isinstance(pairings, dict):
+        return 0
+    return sum(1 for pairing in pairings.values() if isinstance(pairing, dict) and pairing.get("status") == "active")
 
 
 def make_e2ee_pairing_record(home_id, device_id, device_public_key, companion_public_key, key_version):
@@ -4386,7 +4506,7 @@ def normalized_e2ee_public_key(value, request_id="unknown", timing_started_at=No
             input_length=len(candidate),
             decoded_length=len(raw)
         )
-        x25519.X25519PublicKey.from_public_bytes(raw)
+        imported = x25519.X25519PublicKey.from_public_bytes(raw)
         e2ee_public_key_normalization_checkpoint(
             f"{label}.publicKeyImportComplete",
             request_id,
@@ -4436,6 +4556,7 @@ def normalized_e2ee_public_key(value, request_id="unknown", timing_started_at=No
                 lockWaitMs=store_wait_ms
             )
             E2EE_PUBLIC_KEY_NORMALIZATION_CACHE[candidate] = normalized
+            E2EE_PUBLIC_KEY_IMPORT_CACHE[normalized] = imported
         e2ee_public_key_normalization_checkpoint(
             f"{label}.return",
             request_id,
@@ -4458,6 +4579,79 @@ def normalized_e2ee_public_key(value, request_id="unknown", timing_started_at=No
             reason="decodeOrImportError"
         )
         return ""
+
+
+def imported_e2ee_public_key(normalized_public_key, request_id="unknown", timing_started_at=None, label="publicKey"):
+    operation_started_at = time.monotonic()
+    key = str(normalized_public_key or "").strip()
+    e2ee_public_key_normalization_checkpoint(
+        f"{label}.importCacheLookupStart",
+        request_id,
+        timing_started_at,
+        operation_started_at,
+        input_length=len(key)
+    )
+    with timed_lock(E2EE_PUBLIC_KEY_NORMALIZATION_LOCK, "e2eePublicKeyImportCache", request_id=request_id, log_threshold_ms=5):
+        cached = E2EE_PUBLIC_KEY_IMPORT_CACHE.get(key)
+    e2ee_public_key_normalization_checkpoint(
+        f"{label}.importCacheLookupComplete",
+        request_id,
+        timing_started_at,
+        operation_started_at,
+        input_length=len(key),
+        cacheHit=str(cached is not None).lower()
+    )
+    if cached is not None:
+        return cached
+
+    try:
+        decode_started_at = time.monotonic()
+        raw = base64url_decode(key)
+        if len(raw) != 32:
+            e2ee_public_key_normalization_checkpoint(
+                f"{label}.importReturn",
+                request_id,
+                timing_started_at,
+                decode_started_at,
+                input_length=len(key),
+                decoded_length=len(raw),
+                valid=False,
+                reason="invalidLength"
+            )
+            return None
+        import_started_at = time.monotonic()
+        e2ee_public_key_normalization_checkpoint(
+            f"{label}.cachedPublicKeyImportStart",
+            request_id,
+            timing_started_at,
+            import_started_at,
+            input_length=len(key),
+            decoded_length=len(raw)
+        )
+        imported = x25519.X25519PublicKey.from_public_bytes(raw)
+        e2ee_public_key_normalization_checkpoint(
+            f"{label}.cachedPublicKeyImportComplete",
+            request_id,
+            timing_started_at,
+            import_started_at,
+            input_length=len(key),
+            decoded_length=len(raw),
+            valid=True
+        )
+        with timed_lock(E2EE_PUBLIC_KEY_NORMALIZATION_LOCK, "e2eePublicKeyImportCache", request_id=request_id, log_threshold_ms=5):
+            E2EE_PUBLIC_KEY_IMPORT_CACHE[key] = imported
+        return imported
+    except (ValueError, TypeError):
+        e2ee_public_key_normalization_checkpoint(
+            f"{label}.importReturn",
+            request_id,
+            timing_started_at,
+            operation_started_at,
+            input_length=len(key),
+            valid=False,
+            reason="decodeOrImportError"
+        )
+        return None
 
 
 def ingest_remote_pairing_from_supervisor_config():
@@ -5831,6 +6025,8 @@ def main():
     COMPANION_RUNTIME_HEARTBEAT_STOP.clear()
     print(f"[SOSYNC-E2EE-COMPANION] runtimeStarted runtimeInstance={RUNTIME_INSTANCE_ID} build={SOSYNC_COMPANION_BUILD}", flush=True)
     log_e2ee_pairing_store_loaded()
+    prewarm_e2ee_crypto_primitives()
+    prewarm_e2ee_pairing_public_key_cache()
     log_pairing_authorization_loaded()
     prewarm_e2ee_identity_cache()
     binding = read_secure_remote_binding()

@@ -26,6 +26,8 @@ class CompanionP03Tests(unittest.TestCase):
         self.data_dir = self.tmp.name
         self._patch_paths(self.data_dir)
         app.SECURE_REMOTE_DATAPLANE_SESSIONS.clear()
+        app.E2EE_PUBLIC_KEY_NORMALIZATION_CACHE.clear()
+        app.E2EE_PUBLIC_KEY_IMPORT_CACHE.clear()
         os.environ.pop("SOSYNC_BACKEND_SIGNING_PUBLIC_KEY", None)
 
     def tearDown(self):
@@ -393,7 +395,7 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.54"', config)
+        self.assertIn('version: "1.0.55"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
@@ -857,6 +859,65 @@ class CompanionP03Tests(unittest.TestCase):
         second = self._client_to_companion_envelope(binding, {"target": "companion", "method": "GET", "path": "/sosync/home-config"}, sequence=9, transport="rest", message_id="test-rest-9-new")
         plaintext = app.decrypt_secure_remote_dataplane_envelope(binding, second, "client_to_companion", enforce_expiry=False, transport="rest", target="companion", request_class="companionHomeConfig")
         self.assertEqual(json.loads(plaintext.decode("utf-8"))["target"], "companion")
+
+    def test_secure_remote_pairing_public_key_prewarm_populates_import_cache(self):
+        device_public_key = self._seed_e2ee_pairing()
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            app.prewarm_e2ee_pairing_public_key_cache()
+
+        self.assertIn(device_public_key, app.E2EE_PUBLIC_KEY_NORMALIZATION_CACHE.values())
+        self.assertIn(device_public_key, app.E2EE_PUBLIC_KEY_IMPORT_CACHE)
+        logs = captured.getvalue()
+        self.assertIn("event=e2eePairingPublicKeyPrewarmCompleted", logs)
+        self.assertIn("prewarmed=1", logs)
+
+    def test_secure_remote_session_uses_cached_imported_device_public_key(self):
+        home_id = "home_ref"
+        device_id = "device_ref"
+        route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
+        tunnel_id = "tun_abcdefghijklmnopqrstuvwxyz123456"
+        origin_token = "orig_abcdefghijklmnopqrstuvwxyz123456"
+        session_id = "session-prewarmed-public-key"
+        device_public_key = self._seed_e2ee_pairing(home_id, device_id)
+        ephemeral_public_key = self._alternate_device_public_key()
+        app.normalized_e2ee_public_key(device_public_key)
+        app.imported_e2ee_public_key(device_public_key)
+        app.normalized_e2ee_public_key(ephemeral_public_key)
+        app.imported_e2ee_public_key(ephemeral_public_key)
+        binding = app.make_secure_remote_binding(
+            self._secure_remote_binding_request(
+                home_id,
+                device_id,
+                device_public_key,
+                route_id=route_id,
+                tunnel_binding_id=tunnel_id,
+                origin_access_token=origin_token
+            )
+        )
+
+        original_import = app.x25519.X25519PublicKey.from_public_bytes
+
+        def fail_import(_raw):
+            raise AssertionError("public key import should be served from cache on prewarmed session path")
+
+        app.x25519.X25519PublicKey.from_public_bytes = fail_import
+        try:
+            session = app.create_secure_remote_dataplane_session(binding, {
+                "protocol_version": 1,
+                "route_id": route_id,
+                "session_id": session_id,
+                "home_id": home_id,
+                "device_id": device_id,
+                "device_public_key": device_public_key,
+                "device_ephemeral_public_key": ephemeral_public_key
+            })
+        finally:
+            app.x25519.X25519PublicKey.from_public_bytes = original_import
+
+        self.assertEqual(session["session_id"], session_id)
+        self.assertIn((route_id, session_id), app.SECURE_REMOTE_DATAPLANE_SESSIONS)
 
     def test_secure_remote_companion_outbound_sequence_allocation_is_thread_safe(self):
         binding, _ = self._seed_secure_remote_dataplane_session()
