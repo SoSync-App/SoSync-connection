@@ -1560,7 +1560,7 @@ class Handler(BaseHTTPRequestHandler):
                     f"[SOSYNC-COMPANION-E2EE-REST] target=companion method={method} pathClass={companion_rest_path_class_for_log(rest_path)} result=accepted companionBuild={SOSYNC_COMPANION_BUILD}",
                     flush=True
                 )
-                response = perform_secure_remote_companion_rest(method, rest_path, request.get("body_base64url"))
+                response = perform_secure_remote_companion_rest(method, rest_path, request.get("body_base64url"), binding=binding)
                 path_class = companion_rest_path_class_for_log(rest_path)
             else:
                 print(
@@ -2918,31 +2918,80 @@ def decode_secure_remote_companion_rest_body(body_base64url):
     return decoded
 
 
-def perform_secure_remote_companion_rest(method, companion_path, body_base64url):
+def perform_secure_remote_companion_rest(method, companion_path, body_base64url, binding=None):
     parsed = urlparse(companion_path or "/")
     request_path = parsed.path
     if request_path == HOME_CONFIGURATION_PATH and method == "GET":
         expected_home_identity = parse_qs(parsed.query).get("homeIdentity", [""])[0]
+        binding_home_identity = str((binding or {}).get("home_id") or "")
+        print(
+            "[SOSYNC-COMPANION-HOME-CONFIG-AUTH] "
+            "phase=authorizeStarted "
+            "operation=load "
+            "source=secureRemoteCompanion "
+            f"pathClass={companion_rest_path_class_for_log(request_path)} "
+            f"expectedHomeHash={safe_fingerprint(expected_home_identity)} "
+            f"bindingHomeHash={safe_fingerprint(binding_home_identity)}",
+            flush=True
+        )
         if not is_valid_home_config_identity(expected_home_identity):
             log_home_config("identityMismatch", operation="load", reason="invalidExpectedIdentity")
+            print(
+                "[SOSYNC-COMPANION-HOME-CONFIG-AUTH] "
+                "phase=authorizeCompleted operation=load source=secureRemoteCompanion "
+                f"pathClass={companion_rest_path_class_for_log(request_path)} result=rejected reason=invalidExpectedIdentity "
+                f"expectedHomeHash={safe_fingerprint(expected_home_identity)} bindingHomeHash={safe_fingerprint(binding_home_identity)} actualHomeHash=none revision=none",
+                flush=True
+            )
             return secure_remote_json_rest_response(400, {"error": "invalid_home_identity"})
         log_home_config("loadStarted", source="secureRemoteCompanion", homeHash=safe_fingerprint(expected_home_identity))
         try:
             document = read_home_configuration_document()
         except HomeConfigurationPersistenceError as error:
             log_home_config("persistenceFailure", operation="load", reason=error.reason)
+            print(
+                "[SOSYNC-COMPANION-HOME-CONFIG-AUTH] "
+                "phase=authorizeCompleted operation=load source=secureRemoteCompanion "
+                f"pathClass={companion_rest_path_class_for_log(request_path)} result=rejected reason=persistenceFailure "
+                f"expectedHomeHash={safe_fingerprint(expected_home_identity)} bindingHomeHash={safe_fingerprint(binding_home_identity)} actualHomeHash=unknown revision=unknown",
+                flush=True
+            )
             return secure_remote_json_rest_response(500, {"error": "home_config_persistence_failure", "reason": error.reason})
         if document is None:
             log_home_config("loadCompleted", source="secureRemoteCompanion", result="notFound", homeHash=safe_fingerprint(expected_home_identity))
+            print(
+                "[SOSYNC-COMPANION-HOME-CONFIG-AUTH] "
+                "phase=authorizeCompleted operation=load source=secureRemoteCompanion "
+                f"pathClass={companion_rest_path_class_for_log(request_path)} result=rejected reason=notFound "
+                f"expectedHomeHash={safe_fingerprint(expected_home_identity)} bindingHomeHash={safe_fingerprint(binding_home_identity)} actualHomeHash=none revision=none",
+                flush=True
+            )
             return secure_remote_json_rest_response(404, {"error": "not_found"})
+        actual_home_identity = str(document.get("homeIdentity") or "")
         if document.get("homeIdentity") != expected_home_identity:
             log_home_config(
                 "identityMismatch",
                 operation="load",
                 expectedHash=safe_fingerprint(expected_home_identity),
-                actualHash=safe_fingerprint(str(document.get("homeIdentity") or ""))
+                actualHash=safe_fingerprint(actual_home_identity)
+            )
+            print(
+                "[SOSYNC-COMPANION-HOME-CONFIG-AUTH] "
+                "phase=authorizeCompleted operation=load source=secureRemoteCompanion "
+                f"pathClass={companion_rest_path_class_for_log(request_path)} result=rejected reason=homeIdentityMismatch "
+                f"expectedHomeHash={safe_fingerprint(expected_home_identity)} bindingHomeHash={safe_fingerprint(binding_home_identity)} "
+                f"actualHomeHash={safe_fingerprint(actual_home_identity)} revision={document.get('revision', 'unknown')}",
+                flush=True
             )
             return secure_remote_json_rest_response(403, {"error": "home_identity_mismatch"})
+        print(
+            "[SOSYNC-COMPANION-HOME-CONFIG-AUTH] "
+            "phase=authorizeCompleted operation=load source=secureRemoteCompanion "
+            f"pathClass={companion_rest_path_class_for_log(request_path)} result=accepted reason=homeIdentityMatched "
+            f"expectedHomeHash={safe_fingerprint(expected_home_identity)} bindingHomeHash={safe_fingerprint(binding_home_identity)} "
+            f"actualHomeHash={safe_fingerprint(actual_home_identity)} revision={document.get('revision', 'unknown')}",
+            flush=True
+        )
         log_home_config(
             "loadCompleted",
             source="secureRemoteCompanion",
@@ -2959,6 +3008,14 @@ def perform_secure_remote_companion_rest(method, companion_path, body_base64url)
         except ValueError as error:
             return secure_remote_json_rest_response(400, {"error": str(error)})
         home_identity = str(request.get("homeIdentity") or "").strip()
+        binding_home_identity = str((binding or {}).get("home_id") or "")
+        print(
+            "[SOSYNC-COMPANION-HOME-CONFIG-AUTH] "
+            "phase=authorizeStarted operation=create source=secureRemoteCompanion "
+            f"pathClass={companion_rest_path_class_for_log(request_path)} expectedHomeHash={safe_fingerprint(home_identity)} "
+            f"bindingHomeHash={safe_fingerprint(binding_home_identity)}",
+            flush=True
+        )
         if not is_valid_home_config_identity(home_identity):
             log_home_config("identityMismatch", operation="create", reason="invalidHomeIdentity")
             return secure_remote_json_rest_response(400, {"error": "invalid_home_identity"})
@@ -2972,6 +3029,14 @@ def perform_secure_remote_companion_rest(method, companion_path, body_base64url)
                 expectedHash=safe_fingerprint(error.expected),
                 actualHash=safe_fingerprint(error.actual)
             )
+            print(
+                "[SOSYNC-COMPANION-HOME-CONFIG-AUTH] "
+                "phase=authorizeCompleted operation=create source=secureRemoteCompanion "
+                f"pathClass={companion_rest_path_class_for_log(request_path)} result=rejected reason=homeIdentityMismatch "
+                f"expectedHomeHash={safe_fingerprint(error.expected)} bindingHomeHash={safe_fingerprint(binding_home_identity)} "
+                f"actualHomeHash={safe_fingerprint(error.actual)} revision=unknown",
+                flush=True
+            )
             return secure_remote_json_rest_response(403, {"error": "home_identity_mismatch"})
         except HomeConfigurationPersistenceError as error:
             log_home_config("persistenceFailure", operation="create", reason=error.reason)
@@ -2983,6 +3048,14 @@ def perform_secure_remote_companion_rest(method, companion_path, body_base64url)
             homeHash=safe_fingerprint(home_identity),
             revision=document.get("revision", "unknown")
         )
+        print(
+            "[SOSYNC-COMPANION-HOME-CONFIG-AUTH] "
+            "phase=authorizeCompleted operation=create source=secureRemoteCompanion "
+            f"pathClass={companion_rest_path_class_for_log(request_path)} result=accepted reason=homeIdentityMatched "
+            f"expectedHomeHash={safe_fingerprint(home_identity)} bindingHomeHash={safe_fingerprint(binding_home_identity)} "
+            f"actualHomeHash={safe_fingerprint(str(document.get('homeIdentity') or ''))} revision={document.get('revision', 'unknown')}",
+            flush=True
+        )
         return secure_remote_json_rest_response(201 if created else 200, document)
 
     if request_path == HOME_CONFIGURATION_MUTATION_PATH and method == "POST":
@@ -2991,10 +3064,19 @@ def perform_secure_remote_companion_rest(method, companion_path, body_base64url)
         except ValueError as error:
             return secure_remote_json_rest_response(400, {"error": str(error)})
         home_identity = str(request.get("homeIdentity") or "").strip()
+        binding_home_identity = str((binding or {}).get("home_id") or "")
         domain = str(request.get("domain") or "").strip()
         base_domain_revision = request.get("baseDomainRevision")
         updated_by_device = request.get("updatedByDeviceIDHash")
         patch = request.get("patch")
+        print(
+            "[SOSYNC-COMPANION-HOME-CONFIG-AUTH] "
+            "phase=authorizeStarted operation=mutation source=secureRemoteCompanion "
+            f"pathClass={companion_rest_path_class_for_log(request_path)} expectedHomeHash={safe_fingerprint(home_identity)} "
+            f"bindingHomeHash={safe_fingerprint(binding_home_identity)} domain={domain or 'unknown'} "
+            f"baseDomainRevision={base_domain_revision if isinstance(base_domain_revision, int) else 'invalid'}",
+            flush=True
+        )
         if not is_valid_home_config_identity(home_identity):
             log_home_config("identityMismatch", operation="mutation", reason="invalidHomeIdentity")
             return secure_remote_json_rest_response(400, {"error": "invalid_home_identity"})
@@ -3026,6 +3108,14 @@ def perform_secure_remote_companion_rest(method, companion_path, body_base64url)
                 expectedHash=safe_fingerprint(error.expected),
                 actualHash=safe_fingerprint(error.actual)
             )
+            print(
+                "[SOSYNC-COMPANION-HOME-CONFIG-AUTH] "
+                "phase=authorizeCompleted operation=mutation source=secureRemoteCompanion "
+                f"pathClass={companion_rest_path_class_for_log(request_path)} result=rejected reason=homeIdentityMismatch "
+                f"expectedHomeHash={safe_fingerprint(error.expected)} bindingHomeHash={safe_fingerprint(binding_home_identity)} "
+                f"actualHomeHash={safe_fingerprint(error.actual)} revision=unknown domain={domain}",
+                flush=True
+            )
             return secure_remote_json_rest_response(403, {"error": "home_identity_mismatch"})
         except HomeConfigurationConflictError as error:
             log_home_config(
@@ -3056,6 +3146,14 @@ def perform_secure_remote_companion_rest(method, companion_path, body_base64url)
             domain=domain,
             revision=document.get("revision", "unknown"),
             domainRevision=document.get("domainRevisions", {}).get(domain, "unknown")
+        )
+        print(
+            "[SOSYNC-COMPANION-HOME-CONFIG-AUTH] "
+            "phase=authorizeCompleted operation=mutation source=secureRemoteCompanion "
+            f"pathClass={companion_rest_path_class_for_log(request_path)} result=accepted reason=homeIdentityMatched "
+            f"expectedHomeHash={safe_fingerprint(home_identity)} bindingHomeHash={safe_fingerprint(binding_home_identity)} "
+            f"actualHomeHash={safe_fingerprint(str(document.get('homeIdentity') or ''))} revision={document.get('revision', 'unknown')} domain={domain}",
+            flush=True
         )
         return secure_remote_json_rest_response(200, document)
 
