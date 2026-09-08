@@ -57,7 +57,7 @@ jobs:
           push: true
           build-args: |
             SOSYNC_COMPANION_VERSION=${{ steps.version.outputs.version }}
-            SOSYNC_COMPANION_BUILD=secure_remote_companion_home_config_origin_20260908_v1
+            SOSYNC_COMPANION_BUILD=e2ee_rest_valueerror_stage_trace_20260908_v1
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest

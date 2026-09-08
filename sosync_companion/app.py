@@ -1484,12 +1484,45 @@ class Handler(BaseHTTPRequestHandler):
         if not binding:
             return
         try:
+            print("[SOSYNC-COMPANION-E2EE-REST] phase=envelopeParseStarted", flush=True)
             envelope = self._read_json_body(256 * 1024)
+            if not isinstance(envelope, dict):
+                print("[SOSYNC-COMPANION-E2EE-REST] phase=envelopeParseCompleted result=rejected exception=ValueError reason=malformedOuterEnvelope", flush=True)
+                raise ValueError("malformedOuterEnvelope")
+            print("[SOSYNC-COMPANION-E2EE-REST] phase=envelopeParseCompleted result=accepted", flush=True)
             plain = decrypt_secure_remote_dataplane_envelope(binding, envelope, "client_to_companion")
-            request = json.loads(plain.decode("utf-8"))
+            print("[SOSYNC-COMPANION-E2EE-REST] phase=plaintextJSONParseStarted", flush=True)
+            try:
+                plain_text = plain.decode("utf-8")
+            except UnicodeDecodeError:
+                print("[SOSYNC-COMPANION-E2EE-REST] phase=plaintextJSONParseCompleted result=rejected exception=ValueError reason=plaintextNotUTF8", flush=True)
+                raise ValueError("plaintextNotUTF8")
+            try:
+                request = json.loads(plain_text)
+            except json.JSONDecodeError:
+                print("[SOSYNC-COMPANION-E2EE-REST] phase=plaintextJSONParseCompleted result=rejected exception=ValueError reason=plaintextNotJSON", flush=True)
+                raise ValueError("plaintextNotJSON")
+            if not isinstance(request, dict):
+                print("[SOSYNC-COMPANION-E2EE-REST] phase=plaintextJSONParseCompleted result=rejected exception=ValueError reason=payloadNotObject", flush=True)
+                raise ValueError("payloadNotObject")
+            print("[SOSYNC-COMPANION-E2EE-REST] phase=plaintextJSONParseCompleted result=accepted", flush=True)
+            print("[SOSYNC-COMPANION-E2EE-REST] phase=requestProjectionStarted", flush=True)
             rest_target = str(request.get("target") or "ha").strip().lower()
             rest_path = str(request.get("path") or "/")
             method = str(request.get("method") or "GET").upper()
+            if rest_target not in ("ha", "companion"):
+                print("[SOSYNC-COMPANION-E2EE-REST] phase=requestProjectionCompleted result=rejected exception=ValueError reason=invalidTarget", flush=True)
+                raise ValueError("invalidTarget")
+            if method not in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+                print("[SOSYNC-COMPANION-E2EE-REST] phase=requestProjectionCompleted result=rejected exception=ValueError reason=invalidMethod", flush=True)
+                raise ValueError("invalidMethod")
+            if not rest_path.startswith("/"):
+                print("[SOSYNC-COMPANION-E2EE-REST] phase=requestProjectionCompleted result=rejected exception=ValueError reason=invalidPath", flush=True)
+                raise ValueError("invalidPath")
+            print(
+                f"[SOSYNC-COMPANION-E2EE-REST] phase=requestProjectionCompleted result=accepted target={rest_target} method={method} pathClass={companion_rest_path_class_for_log(rest_path) if rest_target == 'companion' else ha_path_class_for_log(rest_path)}",
+                flush=True
+            )
             print(
                 f"[SOSYNC-COMPANION-E2EE-REST] phase=requestDecoded target={rest_target} method={method} pathClass={companion_rest_path_class_for_log(rest_path) if rest_target == 'companion' else ha_path_class_for_log(rest_path)} companionBuild={SOSYNC_COMPANION_BUILD}",
                 flush=True
@@ -1542,14 +1575,15 @@ class Handler(BaseHTTPRequestHandler):
             )
             self._json(200, response_envelope)
         except Exception as error:
+            safe_reason = safe_error_reason(error)
             print(
-                f"[SOSYNC-COMPANION-E2EE-REST] phase=requestRejected target=unknown method=UNKNOWN pathClass=unknown reason={type(error).__name__} companionBuild={SOSYNC_COMPANION_BUILD}",
+                f"[SOSYNC-COMPANION-E2EE-REST] phase=requestRejected target=unknown method=UNKNOWN pathClass=unknown result=rejected exception={type(error).__name__} reason={safe_reason} companionBuild={SOSYNC_COMPANION_BUILD}",
                 flush=True
             )
-            print(f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedRESTRejected reason={type(error).__name__} companionBuild={SOSYNC_COMPANION_BUILD}", flush=True)
+            print(f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedRESTRejected reason={safe_reason} companionBuild={SOSYNC_COMPANION_BUILD}", flush=True)
             self._json(403, {
                 "error": "encrypted_dataplane_rejected",
-                "reason": type(error).__name__,
+                "reason": safe_reason,
                 "companion_build": SOSYNC_COMPANION_BUILD
             })
 
@@ -2560,26 +2594,65 @@ def secure_remote_dataplane_aad(route_id, session_id, device_id, direction, sequ
 
 def decrypt_secure_remote_dataplane_envelope(binding, envelope, expected_direction, enforce_expiry=True):
     decrypt_started_at = time.monotonic()
+    print("[SOSYNC-COMPANION-E2EE-REST] phase=sessionLookupStarted", flush=True)
     session_lookup_started_at = time.monotonic()
     session = secure_remote_dataplane_session(binding, envelope.get("session_id"), enforce_expiry=enforce_expiry)
     session_lookup_ms = elapsed_ms_since(session_lookup_started_at)
     if not session:
-        raise ValueError("encrypted_session_required")
+        print("[SOSYNC-COMPANION-E2EE-REST] phase=sessionLookupCompleted result=rejected exception=ValueError reason=sessionNotFound", flush=True)
+        raise ValueError("sessionNotFound")
+    print(
+        f"[SOSYNC-COMPANION-E2EE-REST] phase=sessionLookupCompleted result=accepted sessionHash={safe_fingerprint(envelope.get('session_id'))}",
+        flush=True
+    )
     if (
         envelope.get("protocol_version") != 1
         or envelope.get("route_id") != binding.get("route_id")
         or envelope.get("device_id") != session.get("device_id")
         or envelope.get("direction") != expected_direction
     ):
-        raise ValueError("invalid_envelope_binding")
-    sequence = int(envelope.get("sequence") or 0)
+        print("[SOSYNC-COMPANION-E2EE-REST] phase=envelopeBindingCompleted result=rejected exception=ValueError reason=invalidEnvelopeBinding", flush=True)
+        raise ValueError("invalidEnvelopeBinding")
+    print("[SOSYNC-COMPANION-E2EE-REST] phase=envelopeBindingCompleted result=accepted", flush=True)
+    print("[SOSYNC-COMPANION-E2EE-REST] phase=sequenceParseStarted", flush=True)
+    try:
+        sequence = int(envelope.get("sequence") or 0)
+    except (TypeError, ValueError):
+        print("[SOSYNC-COMPANION-E2EE-REST] phase=sequenceParseCompleted result=rejected exception=ValueError reason=invalidSequence", flush=True)
+        raise ValueError("invalidSequence")
+    print("[SOSYNC-COMPANION-E2EE-REST] phase=sequenceParseCompleted result=accepted", flush=True)
     if sequence <= int(session.get("highest_client_sequence") or 0):
-        raise ValueError("replay_rejected")
-    nonce = base64url_decode(envelope.get("nonce") or "")
-    ciphertext = base64url_decode(envelope.get("ciphertext") or "")
+        print("[SOSYNC-COMPANION-E2EE-REST] phase=sequenceParseCompleted result=rejected exception=ValueError reason=replayRejected", flush=True)
+        raise ValueError("replayRejected")
+    print("[SOSYNC-COMPANION-E2EE-REST] phase=nonceDecodeStarted", flush=True)
+    try:
+        nonce = base64url_decode(envelope.get("nonce") or "")
+    except Exception:
+        print("[SOSYNC-COMPANION-E2EE-REST] phase=nonceDecodeCompleted result=rejected exception=ValueError reason=invalidBase64Nonce", flush=True)
+        raise ValueError("invalidBase64Nonce")
+    if len(nonce) != 12:
+        print("[SOSYNC-COMPANION-E2EE-REST] phase=nonceDecodeCompleted result=rejected exception=ValueError reason=invalidNonceLength", flush=True)
+        raise ValueError("invalidNonceLength")
+    print("[SOSYNC-COMPANION-E2EE-REST] phase=nonceDecodeCompleted result=accepted", flush=True)
+    print("[SOSYNC-COMPANION-E2EE-REST] phase=ciphertextDecodeStarted", flush=True)
+    try:
+        ciphertext = base64url_decode(envelope.get("ciphertext") or "")
+    except Exception:
+        print("[SOSYNC-COMPANION-E2EE-REST] phase=ciphertextDecodeCompleted result=rejected exception=ValueError reason=invalidBase64Ciphertext", flush=True)
+        raise ValueError("invalidBase64Ciphertext")
+    if not ciphertext:
+        print("[SOSYNC-COMPANION-E2EE-REST] phase=ciphertextDecodeCompleted result=rejected exception=ValueError reason=missingCiphertext", flush=True)
+        raise ValueError("missingCiphertext")
+    print("[SOSYNC-COMPANION-E2EE-REST] phase=ciphertextDecodeCompleted result=accepted", flush=True)
     aad = secure_remote_dataplane_aad(binding.get("route_id"), session["session_id"], session["device_id"], expected_direction, sequence, str(envelope.get("message_id") or ""))
     crypto_core_started_at = time.monotonic()
-    plaintext = ChaCha20Poly1305(session["client_key"]).decrypt(nonce, ciphertext, aad)
+    print("[SOSYNC-COMPANION-E2EE-REST] phase=decryptStarted", flush=True)
+    try:
+        plaintext = ChaCha20Poly1305(session["client_key"]).decrypt(nonce, ciphertext, aad)
+    except Exception:
+        print("[SOSYNC-COMPANION-E2EE-REST] phase=decryptCompleted result=rejected exception=ValueError reason=decryptAuthenticationFailed", flush=True)
+        raise ValueError("decryptAuthenticationFailed")
+    print("[SOSYNC-COMPANION-E2EE-REST] phase=decryptCompleted result=accepted", flush=True)
     crypto_core_ms = elapsed_ms_since(crypto_core_started_at)
     session_update_started_at = time.monotonic()
     with timed_lock(SECURE_REMOTE_DATAPLANE_LOCK, "dataplaneSessionUpdate", log_threshold_ms=10):
@@ -5320,6 +5393,31 @@ def safe_fingerprint(value):
     if not value:
         return "none"
     return sha256_base64url(str(value).encode("utf-8"))[:16]
+
+
+def safe_error_reason(error):
+    raw = str(error or "").strip()
+    allowed = {
+        "malformedOuterEnvelope",
+        "sessionNotFound",
+        "invalidEnvelopeBinding",
+        "invalidSequence",
+        "replayRejected",
+        "invalidBase64Nonce",
+        "invalidBase64Ciphertext",
+        "invalidNonceLength",
+        "missingCiphertext",
+        "decryptAuthenticationFailed",
+        "plaintextNotUTF8",
+        "plaintextNotJSON",
+        "payloadNotObject",
+        "invalidTarget",
+        "invalidMethod",
+        "invalidPath",
+        "body_too_large",
+        "body_not_json_object"
+    }
+    return raw if raw in allowed else type(error).__name__
 
 
 def decode_cloudflare_connector_token_identity(token):

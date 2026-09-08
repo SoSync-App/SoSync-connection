@@ -393,7 +393,7 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.51"', config)
+        self.assertIn('version: "1.0.52"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
@@ -410,8 +410,12 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("tunnelProcessStarted", runtime)
         self.assertIn("tunnelProcessFailed", runtime)
         self.assertIn("SOSYNC_COMPANION_BUILD", runtime)
+        self.assertIn("e2ee_rest_valueerror_stage_trace", (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "publish.yml").read_text(encoding="utf-8"))
         self.assertIn("companion_route_not_allowed", runtime)
         self.assertIn("encrypted_dataplane_rejected", runtime)
+        self.assertIn("phase=sessionLookupStarted", runtime)
+        self.assertIn("phase=decryptCompleted", runtime)
+        self.assertIn("phase=requestProjectionCompleted", runtime)
         self.assertIn("companionBuild marker=", runtime)
         self.assertIn('HOME_CONFIGURATION_PATH = "/sosync/home-config"', runtime)
         self.assertIn('HOME_CONFIGURATION_MUTATION_PATH = "/sosync/home-config/mutate"', runtime)
@@ -1290,16 +1294,140 @@ class CompanionP03Tests(unittest.TestCase):
     def test_secure_remote_encrypted_rest_unknown_companion_path_fails_closed(self):
         binding, headers = self._seed_secure_remote_dataplane_session()
 
-        with self._server() as base_url:
-            status, response = self._request_json_response("POST", base_url, "/secure-remote/data-plane/e2ee/rest", self._client_to_companion_envelope(binding, {
-                "target": "companion",
-                "method": "GET",
-                "path": "/sosync/not-home-config",
-                "headers": {"Accept": "application/json"}
-            }), headers=headers)[:2]
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            with self._server() as base_url:
+                status, response = self._request_json_response("POST", base_url, "/secure-remote/data-plane/e2ee/rest", self._client_to_companion_envelope(binding, {
+                    "target": "companion",
+                    "method": "GET",
+                    "path": "/sosync/not-home-config",
+                    "headers": {"Accept": "application/json"}
+                }), headers=headers)[:2]
 
         self.assertEqual(status, 403)
         self.assertEqual(response["error"], "companion_route_not_allowed")
+        logs = captured.getvalue()
+        self.assertIn("phase=decryptCompleted result=accepted", logs)
+        self.assertIn("phase=requestProjectionCompleted result=accepted target=companion method=GET pathClass=companionRejected", logs)
+        self.assertIn("phase=routeRejected target=companion method=GET pathClass=companionRejected reason=companionRouteNotAllowed", logs)
+
+    def test_secure_remote_encrypted_rest_tampered_ciphertext_fails_before_projection(self):
+        binding, headers = self._seed_secure_remote_dataplane_session()
+        envelope = self._client_to_companion_envelope(binding, {
+            "target": "companion",
+            "method": "GET",
+            "path": "/sosync/home-config?homeIdentity=stable-home-identity",
+            "headers": {"Accept": "application/json"}
+        })
+        envelope["ciphertext"] = envelope["ciphertext"][:-1] + ("A" if envelope["ciphertext"][-1] != "A" else "B")
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            with self._server() as base_url:
+                status, response = self._request_json_response(
+                    "POST",
+                    base_url,
+                    "/secure-remote/data-plane/e2ee/rest",
+                    envelope,
+                    headers=headers
+                )[:2]
+
+        self.assertEqual(status, 403)
+        self.assertEqual(response["error"], "encrypted_dataplane_rejected")
+        self.assertEqual(response["reason"], "decryptAuthenticationFailed")
+        logs = captured.getvalue()
+        self.assertIn("phase=decryptCompleted result=rejected exception=ValueError reason=decryptAuthenticationFailed", logs)
+        self.assertNotIn("phase=requestProjectionCompleted result=accepted", logs)
+
+    def test_secure_remote_encrypted_rest_wrong_nonce_fails_before_projection(self):
+        binding, headers = self._seed_secure_remote_dataplane_session()
+        envelope = self._client_to_companion_envelope(binding, {
+            "target": "companion",
+            "method": "GET",
+            "path": "/sosync/home-config?homeIdentity=stable-home-identity",
+            "headers": {"Accept": "application/json"}
+        })
+        envelope["nonce"] = app.base64url_encode(os.urandom(8))
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            with self._server() as base_url:
+                status, response = self._request_json_response(
+                    "POST",
+                    base_url,
+                    "/secure-remote/data-plane/e2ee/rest",
+                    envelope,
+                    headers=headers
+                )[:2]
+
+        self.assertEqual(status, 403)
+        self.assertEqual(response["error"], "encrypted_dataplane_rejected")
+        self.assertEqual(response["reason"], "invalidNonceLength")
+        logs = captured.getvalue()
+        self.assertIn("phase=nonceDecodeCompleted result=rejected exception=ValueError reason=invalidNonceLength", logs)
+        self.assertNotIn("phase=requestProjectionCompleted result=accepted", logs)
+
+    def test_secure_remote_encrypted_rest_replay_fails_before_projection(self):
+        binding, headers = self._seed_secure_remote_dataplane_session()
+        envelope = self._client_to_companion_envelope(binding, {
+            "target": "companion",
+            "method": "GET",
+            "path": "/sosync/home-config?homeIdentity=stable-home-identity",
+            "headers": {"Accept": "application/json"}
+        })
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            with self._server() as base_url:
+                first_status, _ = self._request_json_response(
+                    "POST",
+                    base_url,
+                    "/secure-remote/data-plane/e2ee/rest",
+                    envelope,
+                    headers=headers
+                )[:2]
+                replay_status, replay_response = self._request_json_response(
+                    "POST",
+                    base_url,
+                    "/secure-remote/data-plane/e2ee/rest",
+                    envelope,
+                    headers=headers
+                )[:2]
+
+        self.assertEqual(first_status, 200)
+        self.assertEqual(replay_status, 403)
+        self.assertEqual(replay_response["error"], "encrypted_dataplane_rejected")
+        self.assertEqual(replay_response["reason"], "replayRejected")
+        logs = captured.getvalue()
+        self.assertIn("phase=sequenceParseCompleted result=rejected exception=ValueError reason=replayRejected", logs)
+
+    def test_secure_remote_encrypted_rest_wrong_session_fails_before_projection(self):
+        binding, headers = self._seed_secure_remote_dataplane_session()
+        envelope = self._client_to_companion_envelope(binding, {
+            "target": "companion",
+            "method": "GET",
+            "path": "/sosync/home-config?homeIdentity=stable-home-identity",
+            "headers": {"Accept": "application/json"}
+        })
+        envelope["session_id"] = "unknown-session"
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            with self._server() as base_url:
+                status, response = self._request_json_response(
+                    "POST",
+                    base_url,
+                    "/secure-remote/data-plane/e2ee/rest",
+                    envelope,
+                    headers=headers
+                )[:2]
+
+        self.assertEqual(status, 403)
+        self.assertEqual(response["error"], "encrypted_dataplane_rejected")
+        self.assertEqual(response["reason"], "sessionNotFound")
+        logs = captured.getvalue()
+        self.assertIn("phase=sessionLookupCompleted result=rejected exception=ValueError reason=sessionNotFound", logs)
+        self.assertNotIn("phase=requestProjectionCompleted result=accepted", logs)
 
     def test_secure_remote_encrypted_rest_default_target_still_proxies_home_assistant(self):
         binding, headers = self._seed_secure_remote_dataplane_session()
