@@ -393,7 +393,7 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.50"', config)
+        self.assertIn('version: "1.0.51"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
@@ -410,6 +410,8 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("tunnelProcessStarted", runtime)
         self.assertIn("tunnelProcessFailed", runtime)
         self.assertIn("SOSYNC_COMPANION_BUILD", runtime)
+        self.assertIn("companion_route_not_allowed", runtime)
+        self.assertIn("encrypted_dataplane_rejected", runtime)
         self.assertIn("companionBuild marker=", runtime)
         self.assertIn('HOME_CONFIGURATION_PATH = "/sosync/home-config"', runtime)
         self.assertIn('HOME_CONFIGURATION_MUTATION_PATH = "/sosync/home-config/mutate"', runtime)

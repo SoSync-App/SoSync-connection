@@ -1510,7 +1510,11 @@ class Handler(BaseHTTPRequestHandler):
                         f"[SOSYNC-COMPANION-E2EE-REST] phase=routeRejected target=companion method={method} pathClass={companion_rest_path_class_for_log(rest_path)} reason=companionRouteNotAllowed companionBuild={SOSYNC_COMPANION_BUILD}",
                         flush=True
                     )
-                    self._json(403, {"error": "companion_route_not_allowed"})
+                    self._json(403, {
+                        "error": "companion_route_not_allowed",
+                        "path_class": companion_rest_path_class_for_log(rest_path),
+                        "companion_build": SOSYNC_COMPANION_BUILD
+                    })
                     return
                 print(
                     f"[SOSYNC-COMPANION-E2EE-REST] target=companion method={method} pathClass={companion_rest_path_class_for_log(rest_path)} result=accepted companionBuild={SOSYNC_COMPANION_BUILD}",
@@ -1538,8 +1542,16 @@ class Handler(BaseHTTPRequestHandler):
             )
             self._json(200, response_envelope)
         except Exception as error:
-            print(f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedRESTRejected reason={type(error).__name__}", flush=True)
-            self._json(403, {"error": "encrypted_dataplane_rejected"})
+            print(
+                f"[SOSYNC-COMPANION-E2EE-REST] phase=requestRejected target=unknown method=UNKNOWN pathClass=unknown reason={type(error).__name__} companionBuild={SOSYNC_COMPANION_BUILD}",
+                flush=True
+            )
+            print(f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedRESTRejected reason={type(error).__name__} companionBuild={SOSYNC_COMPANION_BUILD}", flush=True)
+            self._json(403, {
+                "error": "encrypted_dataplane_rejected",
+                "reason": type(error).__name__,
+                "companion_build": SOSYNC_COMPANION_BUILD
+            })
 
     def _handle_secure_remote_dataplane_websocket(self):
         timing_started_at = self._session_timing_started_at()
