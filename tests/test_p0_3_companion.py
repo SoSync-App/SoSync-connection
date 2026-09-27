@@ -105,7 +105,7 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertLess(elapsed, 1.0)
 
     def test_listener_address_summary_proves_lan_bind_without_secret_payload(self):
-        server = ThreadingHTTPServer(("0.0.0.0", 0), app.Handler)
+        server = app.SoSyncCompanionHTTPServer(("0.0.0.0", 0), app.Handler)
         try:
             summary = app.companion_listener_address_summary(server)
         finally:
@@ -115,6 +115,34 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("port=", summary)
         self.assertNotIn("private_key", summary)
         self.assertNotIn("token", summary)
+
+    def test_companion_http_server_reuses_address_for_supervisor_restart(self):
+        self.assertTrue(app.SoSyncCompanionHTTPServer.allow_reuse_address)
+
+    def test_startup_pairing_authorization_config_accepts_generated_shape(self):
+        self._write_options({
+            "e2ee_pairing_authorization": {
+                "token": "local-pairing-token",
+                "expires_at": app.iso_from_now(120)
+            }
+        })
+
+        status = app.validate_startup_pairing_authorization_config()
+
+        self.assertTrue(status["configured"])
+        self.assertTrue(status["expires_parse_success"])
+        self.assertFalse(status["expired"])
+
+    def test_startup_pairing_authorization_config_rejects_malformed_expiry(self):
+        self._write_options({
+            "e2ee_pairing_authorization": {
+                "token": "local-pairing-token",
+                "expires_at": "not-a-date"
+            }
+        })
+
+        with self.assertRaises(ValueError):
+            app.validate_startup_pairing_authorization_config()
 
     def test_e2ee_identity_route_is_exposed_by_addon_runtime(self):
         with self._server() as base_url:
@@ -180,7 +208,7 @@ class CompanionP03Tests(unittest.TestCase):
         pairings = json.loads(Path(app.E2EE_PAIRINGS_FILE).read_text(encoding="utf-8"))
         self.assertEqual(pairings["devices"]["22222222-2222-4222-8222-222222222222"]["status"], "active")
         options = json.loads(Path(app.ADDON_OPTIONS_FILE).read_text(encoding="utf-8"))
-        self.assertNotIn("e2ee_pairing_authorization", options)
+        self.assertEqual(options.get("e2ee_pairing_authorization"), {})
 
     def test_e2ee_pair_accepts_protocol_1_sosync_home_identity(self):
         device_private = x25519.X25519PrivateKey.generate()
@@ -395,7 +423,7 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.55"', config)
+        self.assertIn('version: "1.0.57"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
@@ -412,7 +440,7 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("tunnelProcessStarted", runtime)
         self.assertIn("tunnelProcessFailed", runtime)
         self.assertIn("SOSYNC_COMPANION_BUILD", runtime)
-        self.assertIn("e2ee_rest_valueerror_stage_trace", (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "publish.yml").read_text(encoding="utf-8"))
+        self.assertIn("secure_remote_route_activation_20260927_v1", (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "publish.yml").read_text(encoding="utf-8"))
         self.assertIn("companion_route_not_allowed", runtime)
         self.assertIn("encrypted_dataplane_rejected", runtime)
         self.assertIn("phase=sessionLookupStarted", runtime)
@@ -614,9 +642,10 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertNotIn("secret-tunnel-credential", serialized)
         self.assertNotIn("tunnel_credential", serialized)
 
-    def test_secure_remote_dataplane_health_contract_is_versioned_public_and_path_stable(self):
+    def test_secure_remote_dataplane_health_contract_is_versioned_authorized_and_path_stable(self):
         route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
         tunnel_id = "tun_abcdefghijklmnopqrstuvwxyz123456"
+        origin_token = "orig_abcdefghijklmnopqrstuvwxyz123456"
         self._patch_cloudflared_start(running=True)
         try:
             with self._server() as base_url:
@@ -627,7 +656,7 @@ class CompanionP03Tests(unittest.TestCase):
                     self._valid_secure_remote_binding_request(
                         route_id=route_id,
                         tunnel_binding_id=tunnel_id,
-                        origin_access_token="orig_abcdefghijklmnopqrstuvwxyz123456"
+                        origin_access_token=origin_token
                     )
                 )
                 install_status, _ = self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
@@ -636,12 +665,20 @@ class CompanionP03Tests(unittest.TestCase):
                     "credential_version": 1,
                     "tunnel_credential": "secret-tunnel-credential"
                 })
-                health_status, health, headers = self._request_json_response("GET", base_url, "/secure-remote/data-plane/health/")
+                unauth_status, unauth_body, unauth_headers = self._request_json_response("GET", base_url, "/secure-remote/data-plane/health/")
+                health_status, health, headers = self._request_json_response("GET", base_url, "/secure-remote/data-plane/health/", headers={
+                    "X-SoSync-Secure-Remote-Route": tunnel_id,
+                    "X-SoSync-Secure-Remote-Origin-Token": origin_token
+                })
         finally:
             self._restore_cloudflared_start()
 
         self.assertEqual(provision_status, 200)
         self.assertEqual(install_status, 200)
+        self.assertEqual(unauth_status, 401)
+        self.assertEqual(unauth_body["error"], "unauthorized")
+        self.assertEqual(unauth_headers.get("X-SoSync-Origin"), "companion")
+        self.assertEqual(unauth_headers.get("X-SoSync-Route"), "auth")
         self.assertEqual(health_status, 200)
         self.assertEqual(health["protocol_version"], 1)
         self.assertEqual(health["status"], "ok")
@@ -2146,6 +2183,7 @@ class CompanionP03Tests(unittest.TestCase):
     def test_secure_remote_tunnel_install_starting_then_healthy_is_nonterminal(self):
         route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
         tunnel_id = "tun_abcdefghijklmnopqrstuvwxyz123456"
+        origin_token = "orig_abcdefghijklmnopqrstuvwxyz123456"
         self._patch_cloudflared_start(running=True, stderr_message="INF cloudflared started but waiting for edge")
         try:
             with self._server() as base_url:
@@ -2153,7 +2191,11 @@ class CompanionP03Tests(unittest.TestCase):
                     "POST",
                     base_url,
                     "/secure-remote/provision",
-                    self._valid_secure_remote_binding_request(route_id=route_id, tunnel_binding_id=tunnel_id)
+                    self._valid_secure_remote_binding_request(
+                        route_id=route_id,
+                        tunnel_binding_id=tunnel_id,
+                        origin_access_token=origin_token
+                    )
                 )
                 install_status, install = self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
                     "protocol_version": 1,
@@ -2161,7 +2203,10 @@ class CompanionP03Tests(unittest.TestCase):
                     "credential_version": 1,
                     "tunnel_credential": "secret-tunnel-credential"
                 })
-                health_status, health, _ = self._request_json_response("GET", base_url, "/secure-remote/data-plane/health/")
+                health_status, health, _ = self._request_json_response("GET", base_url, "/secure-remote/data-plane/health/", headers={
+                    "X-SoSync-Secure-Remote-Route": tunnel_id,
+                    "X-SoSync-Secure-Remote-Origin-Token": origin_token
+                })
                 with open(app.secure_remote_tunnel_stderr_file(), "ab") as stderr:
                     stderr.write(b"\nINF Registered tunnel connection connIndex=0")
                 app.SECURE_REMOTE_CONNECTOR_STATUS_CACHE = None
@@ -2769,7 +2814,7 @@ class CompanionP03Tests(unittest.TestCase):
 
     class _server:
         def __init__(self_outer):
-            self_outer.server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+            self_outer.server = app.SoSyncCompanionHTTPServer(("127.0.0.1", 0), app.Handler)
             self_outer.thread = threading.Thread(target=self_outer.server.serve_forever, daemon=True)
 
         def __enter__(self_outer):

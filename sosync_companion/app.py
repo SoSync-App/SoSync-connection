@@ -117,6 +117,12 @@ CLOUDFLARED_RUNTIME_STATUS_CACHE = None
 CLOUDFLARED_RUNTIME_STATUS_CACHE_EXPIRES_AT = 0
 SECURE_REMOTE_CONNECTOR_STATUS_CACHE = None
 SECURE_REMOTE_CONNECTOR_STATUS_CACHE_EXPIRES_AT = 0
+
+
+class SoSyncCompanionHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
 print(
     f"[SOSYNC-E2EE-COMPANION] runtimeGlobalsInitialized runtimeInstance={RUNTIME_INSTANCE_ID} build={SOSYNC_COMPANION_BUILD}",
     flush=True
@@ -1683,6 +1689,21 @@ class Handler(BaseHTTPRequestHandler):
             }, headers={
                 "X-SoSync-Origin": "companion",
                 "X-SoSync-Route": "health"
+            })
+            return
+        route = self.headers.get("X-SoSync-Secure-Remote-Route")
+        token = self.headers.get("X-SoSync-Secure-Remote-Origin-Token")
+        stored_token = str(binding.get("origin_access_token") or "").strip()
+        route_ok = hmac.compare_digest(str(route or ""), str(binding.get("tunnel_binding_id") or ""))
+        token_ok = bool(stored_token) and hmac.compare_digest(str(token or ""), stored_token)
+        print(
+            f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionHealthOriginValidation route={safe_fingerprint(binding.get('route_id'))} tunnelBinding={safe_fingerprint(binding.get('tunnel_binding_id'))} routeValidationPassed={route_ok} originTokenValidationPassed={token_ok}",
+            flush=True
+        )
+        if not route_ok or not token_ok:
+            self._json(401, {"error": "unauthorized"}, headers={
+                "X-SoSync-Origin": "companion",
+                "X-SoSync-Route": "auth"
             })
             return
         process_running = is_secure_remote_tunnel_running()
@@ -4236,6 +4257,27 @@ def log_pairing_authorization_loaded():
     )
 
 
+def validate_startup_pairing_authorization_config():
+    print("[SOSYNC-E2EE-COMPANION] startupConfigValidationStarted key=e2ee_pairing_authorization", flush=True)
+    status = e2ee_pairing_authorization_status()
+    configured = bool(status.get("configured"))
+    expires_parse_success = bool(status.get("expires_parse_success"))
+    if configured and not expires_parse_success:
+        print(
+            "[SOSYNC-E2EE-COMPANION] "
+            "startupConfigValidationFailed key=e2ee_pairing_authorization reason=invalidExpiry",
+            flush=True
+        )
+        raise ValueError("invalid e2ee_pairing_authorization.expires_at")
+    print(
+        "[SOSYNC-E2EE-COMPANION] "
+        f"startupConfigValidationCompleted key=e2ee_pairing_authorization configured={configured} "
+        f"expiresParseSuccess={expires_parse_success}",
+        flush=True
+    )
+    return status
+
+
 def token_fingerprint(value):
     candidate = str(value or "").strip()
     if not candidate:
@@ -4263,7 +4305,11 @@ def clear_e2ee_pairing_authorization():
     if not isinstance(options, dict):
         return
     changed = False
-    for key in ("e2ee_pairing_authorization", "e2eePairingAuthorization", "localPairingToken", "local_pairing_token"):
+    authorization = options.get("e2ee_pairing_authorization")
+    if authorization != {}:
+        options["e2ee_pairing_authorization"] = {}
+        changed = True
+    for key in ("e2eePairingAuthorization", "localPairingToken", "local_pairing_token"):
         if key in options:
             options.pop(key, None)
             changed = True
@@ -6024,13 +6070,18 @@ def is_local_client(address):
 def main():
     COMPANION_RUNTIME_HEARTBEAT_STOP.clear()
     print(f"[SOSYNC-E2EE-COMPANION] runtimeStarted runtimeInstance={RUNTIME_INSTANCE_ID} build={SOSYNC_COMPANION_BUILD}", flush=True)
+    print("[SOSYNC-E2EE-COMPANION] startupStarted", flush=True)
     log_e2ee_pairing_store_loaded()
+    print("[SOSYNC-E2EE-COMPANION] e2eeInitStarted", flush=True)
     prewarm_e2ee_crypto_primitives()
     prewarm_e2ee_pairing_public_key_cache()
+    validate_startup_pairing_authorization_config()
     log_pairing_authorization_loaded()
     prewarm_e2ee_identity_cache()
+    print("[SOSYNC-E2EE-COMPANION] e2eeInitCompleted", flush=True)
     binding = read_secure_remote_binding()
     if binding.get("route_id") and read_secure_text_file(secure_remote_tunnel_token_file()):
+        print("[SOSYNC-SECURE-REMOTE-COMPANION] startupTunnelRestoreStarted", flush=True)
         start_result = start_secure_remote_tunnel(binding)
         connector_healthy = bool(start_result.get("connector_healthy"))
         binding["tunnel_configured"] = connector_healthy
@@ -6041,6 +6092,10 @@ def main():
             binding["last_connected_at"] = binding.get("last_connected_at") or iso_now()
         binding["updated_at"] = iso_now()
         write_json_file_secure(SECURE_REMOTE_BINDING_FILE, binding)
+        print(
+            f"[SOSYNC-SECURE-REMOTE-COMPANION] startupTunnelRestoreCompleted running={start_result.get('running')} connectorHealthy={connector_healthy} stage={start_result.get('stage')}",
+            flush=True
+        )
     elif binding.get("tunnel_configured"):
         binding["tunnel_configured"] = False
         binding["tunnel_state"] = "notConfigured"
@@ -6055,7 +6110,7 @@ def main():
         flush=True
     )
     try:
-        server = ThreadingHTTPServer((bind_address, PORT), Handler)
+        server = SoSyncCompanionHTTPServer((bind_address, PORT), Handler)
     except BaseException as error:
         print(
             f"[SOSYNC-COMPANION-LISTENER] state=failed bindAddress={bind_address} port={PORT} runtimeInstance={RUNTIME_INSTANCE_ID} reason={type(error).__name__}",
